@@ -1,8 +1,8 @@
 from flask import Flask, jsonify, request
 from sqlalchemy.exc import IntegrityError
 from config import Config
-from models import db, User
-from datetime import date
+from models import db, User,Challenge
+from datetime import date,datetime
 
 app = Flask(__name__)
 app.config.from_object(Config)
@@ -70,6 +70,42 @@ def add_user():
         db.session.rollback()  # Rollback the transaction in case of an error
         return jsonify({'error': 'Username or email already exists'}), 400
     
+
+    except Exception as e:
+        db.session.rollback()  # Rollback the transaction in case of an error
+        return jsonify({'error': str(e)}), 500
+    
+@app.route('/challenges', methods=['GET'])
+def get_challenge():
+    challenges = Challenge.query.all()
+    return jsonify([challenge.to_dict() for challenge in challenges])
+
+@app.route('/challenges', methods=['POST'])
+def add_challenge():
+    # Extract parameters from the request
+    title = request.form.get('title')
+    description = request.form.get('description')
+    reward_points = request.form.get('reward_points', type=int)
+    deadline = request.form.get('deadline')  # Expected in ISO format (e.g., "2025-04-20T23:59:59")
+
+    # Validate required fields
+    if not title or not reward_points or not deadline:
+        return jsonify({'error': 'Title, reward points, and deadline are required'}), 400
+
+    try:
+        # Convert deadline to a datetime object
+        deadline = datetime.fromisoformat(deadline)
+
+        # Create a new Challenge object
+        new_challenge = Challenge(
+            title=title,
+            description=description,
+            reward_points=reward_points,
+            deadline=deadline
+        )
+        db.session.add(new_challenge)  # Add the new challenge to the session
+        db.session.commit()  # Commit the transaction to save the challenge
+        return jsonify({'message': 'Challenge added successfully', 'challenge': new_challenge.to_dict()}), 201
 
     except Exception as e:
         db.session.rollback()  # Rollback the transaction in case of an error

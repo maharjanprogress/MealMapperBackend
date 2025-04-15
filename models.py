@@ -1,6 +1,7 @@
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy.dialects.postgresql import JSON
-from sqlalchemy import CheckConstraint
+from sqlalchemy import CheckConstraint, UniqueConstraint
+from datetime import datetime
 
 db = SQLAlchemy()
 
@@ -50,4 +51,69 @@ class User(db.Model):
             'address': self.address
 
             # ⚠️ Not including password for security reasons
+        }
+    
+class Challenge(db.Model):
+    __tablename__ = 'challenge'
+
+    challengeId = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(100), nullable=False)
+    description = db.Column(db.Text)
+    reward_points = db.Column(db.Integer, nullable=False)
+    deadline = db.Column(db.DateTime, nullable=False)
+
+    def to_dict(self):
+        return {
+            'challengeId': self.challengeId,
+            'title': self.title,
+            'description': self.description,
+            'reward_points': self.reward_points,
+            'deadline': self.deadline.isoformat() if self.deadline else None
+        }
+
+class AcceptedChallenge(db.Model):
+    __tablename__ = 'accepted_challenge'
+
+    id = db.Column(db.Integer, primary_key=True)
+    challengeId = db.Column(db.Integer, db.ForeignKey('challenge.challengeId', ondelete='CASCADE'), nullable=False)
+    userId = db.Column(db.Integer, db.ForeignKey('users.userid', ondelete='CASCADE'), nullable=False)
+    progress = db.Column(db.Integer, default=0, nullable=False)
+    deadline_reached = db.Column(db.Boolean, default=False)
+    accepted_date = db.Column(db.DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        CheckConstraint("progress >= 0 AND progress <= 100", name="valid_progress_constraint"),
+        UniqueConstraint('challengeId', 'userId', name='unique_challenge_user')
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'challengeId': self.challengeId,
+            'userId': self.userId,
+            'progress': self.progress,
+            'deadline_reached': self.deadline_reached,
+            'accepted_date': self.accepted_date.isoformat() if self.accepted_date else None
+        }
+
+class LeaderBoard(db.Model):
+    __tablename__ = 'leader_board'
+
+    leaderId = db.Column(db.Integer, primary_key=True)
+    userId = db.Column(db.Integer, db.ForeignKey('users.userid', ondelete='CASCADE'), nullable=False)
+    season = db.Column(db.String(10), nullable=False)  # e.g., '2025-Q2'
+    points = db.Column(db.Integer, default=0)
+    last_updated_date = db.Column(db.DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint('userId', 'season', name='unique_user_season'),
+    )
+
+    def to_dict(self):
+        return {
+            'leaderId': self.leaderId,
+            'userId': self.userId,
+            'season': self.season,
+            'points': self.points,
+            'last_updated_date': self.last_updated_date.isoformat() if self.last_updated_date else None
         }
