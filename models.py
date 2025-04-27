@@ -79,7 +79,7 @@ class AcceptedChallenge(db.Model):
     userId = db.Column(db.Integer, db.ForeignKey('users.userid', ondelete='CASCADE'), nullable=False)
     progress = db.Column(db.Integer, default=0, nullable=False)
     deadline_reached = db.Column(db.Boolean, default=False)
-    accepted_date = db.Column(db.DateTime, default=datetime.utcnow)
+    accepted_date = db.Column(db.DateTime, default=lambda: datetime.now(datetime.timezone.utc))
 
     __table_args__ = (
         CheckConstraint("progress >= 0 AND progress <= 100", name="valid_progress_constraint"),
