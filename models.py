@@ -61,6 +61,8 @@ class Challenge(db.Model):
     description = db.Column(db.Text)
     reward_points = db.Column(db.Integer, nullable=False)
     deadline = db.Column(db.DateTime, nullable=False)
+    difficulty = db.Column(db.String, nullable=True)
+    requirements = db.Column(JSON, nullable=False)  # New column added
 
     def to_dict(self):
         return {
@@ -68,7 +70,10 @@ class Challenge(db.Model):
             'title': self.title,
             'description': self.description,
             'reward_points': self.reward_points,
-            'deadline': self.deadline.isoformat() if self.deadline else None
+            'deadline': self.deadline.isoformat() if self.deadline else None,
+            'difficulty': self.difficulty,
+            'requirements': self.requirements
+
         }
 
 class AcceptedChallenge(db.Model):
@@ -78,9 +83,12 @@ class AcceptedChallenge(db.Model):
     challengeId = db.Column(db.Integer, db.ForeignKey('challenge.challengeId', ondelete='CASCADE'), nullable=False)
     userId = db.Column(db.Integer, db.ForeignKey('users.userid', ondelete='CASCADE'), nullable=False)
     progress = db.Column(db.Integer, default=0, nullable=False)
-    deadline_reached = db.Column(db.Boolean, default=False)
+    completed = db.Column(db.Boolean, default=False)
     accepted_date = db.Column(db.DateTime, default=lambda: datetime.now(datetime.timezone.utc))
 
+    # Define relationship with Challenge
+    challenge = db.relationship('Challenge', backref='accepted_challenges', lazy=True)
+    
     __table_args__ = (
         CheckConstraint("progress >= 0 AND progress <= 100", name="valid_progress_constraint"),
         UniqueConstraint('challengeId', 'userId', name='unique_challenge_user')
@@ -92,7 +100,7 @@ class AcceptedChallenge(db.Model):
             'challengeId': self.challengeId,
             'userId': self.userId,
             'progress': self.progress,
-            'deadline_reached': self.deadline_reached,
+            'completed': self.completed,
             'accepted_date': self.accepted_date.isoformat() if self.accepted_date else None
         }
 

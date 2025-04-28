@@ -2,7 +2,7 @@ from flask import Flask, jsonify, request
 from sqlalchemy.exc import IntegrityError
 from config import Config
 from models import db, User,Challenge,AcceptedChallenge,LeaderBoard
-from datetime import date,datetime
+from datetime import date,datetime,timezone
 import os
 from werkzeug.utils import secure_filename
 import numpy as np
@@ -136,22 +136,56 @@ def add_user():
         db.session.rollback()  # Rollback the transaction in case of an error
         return create_response("error", 500, "An error occurred", str(e))
 
-@app.route('/challenges', methods=['GET'])
-def get_challenge():
-    challenges = Challenge.query.all()
-    return create_response("success", 200, "Challenges retrieved successfully", [challenge.to_dict() for challenge in challenges])
+@app.route('/challenges/<int:userId>', methods=['GET'])
+def get_challenges_for_user(userId):
+    today = datetime.today()
+
+    # Get all challenge IDs that the user has already accepted
+    accepted_challenge_ids = db.session.query(AcceptedChallenge.challengeId).filter_by(userId=userId).all()
+    accepted_challenge_ids = [row[0] for row in accepted_challenge_ids]  # Extract IDs from query result
+    # Query challenges where the deadline is in the future and not already accepted by the user
+    challenges = Challenge.query.filter(
+        Challenge.deadline > today,
+        ~Challenge.challengeId.in_(accepted_challenge_ids)  # Exclude accepted challenges
+    ).all()
+
+    # Format the response
+    formatted_challenges = []
+    for challenge in challenges:
+        duration = (challenge.deadline - today).days  # Calculate duration in days
+        formatted_challenges.append({
+            'id': challenge.challengeId,
+            'title': challenge.title,
+            'description': challenge.description,
+            'difficulty': challenge.difficulty,
+            'points': challenge.reward_points,
+            'duration': f"{duration} days" if duration > 0 else "Expired"
+        })
+
+    return create_response("success", 200, "Challenges retrieved successfully", formatted_challenges)
+
 
 
 @app.route('/challenges', methods=['POST'])
 def add_challenge():
-    # Extract parameters from the request
-    title = request.form.get('title')
-    description = request.form.get('description')
-    reward_points = request.form.get('reward_points', type=int)
-    deadline = request.form.get('deadline')  # Expected in ISO format (e.g., "2025-04-20T23:59:59")
+    # Check if the request is JSON
+    if not request.is_json:
+        return create_response("error", 415, "Content-Type must be application/json")
+
+    # Parse the JSON request body
+    data = request.get_json()
+
+    # Extract parameters from the JSON body
+    title = data.get('title')
+    description = data.get('description')
+    reward_points = data.get('reward_points')
+    deadline = data.get('deadline')  # Expected in ISO format (e.g., "2025-04-29T23:59:59")
+    difficulty = data.get('difficulty')  # New field
+    requirements = data.get('requirements')  # New field
+
 
     # Validate required fields
-    if not title or not reward_points or not deadline:
+    if not title or not reward_points or not deadline or not requirements:
         return create_response("error", 400, "Title, reward points, and deadline are required")
 
     try:
@@ -163,7 +197,10 @@ def add_challenge():
             title=title,
             description=description,
             reward_points=reward_points,
-            deadline=deadline
+            deadline=deadline,
+            difficulty=difficulty,
+            requirements=requirements
+
         )
         db.session.add(new_challenge)  # Add the new challenge to the session
         db.session.commit()  # Commit the transaction to save the challenge
@@ -174,35 +211,130 @@ def add_challenge():
         return create_response("error", 500, "An error occurred", str(e))
 
 
-@app.route('/accepted_challenges', methods=['GET'])
-def get_accepted_challenges():
-    accepted_challenges = AcceptedChallenge.query.all()
-    return create_response("success", 200, "Accepted challenges retrieved successfully", [challenge.to_dict() for challenge in accepted_challenges])
+@app.route('/accepted_challenges/<int:userId>', methods=['GET'])
+def get_accepted_challenges_for_user(userId):
+    today = datetime.today()
+    print(today)
+    # Perform an inner join between AcceptedChallenge and Challenge
+    results = db.session.query(
+        AcceptedChallenge.progress,
+        AcceptedChallenge.completed,
+        Challenge.title,
+        Challenge.description,
+        Challenge.deadline,
+        Challenge.reward_points
+    ).join(Challenge, AcceptedChallenge.challengeId == Challenge.challengeId) \
+     .filter(
+         AcceptedChallenge.userId == userId,  # Filter by userId
+         AcceptedChallenge.completed == False,  # Only show incomplete challenges
+         Challenge.deadline > today  # Only show challenges whose deadline has not passed
+     ).all()
+
+    # Format the response
+    formatted_challenges = []
+    for result in results:
+        progress, completed, title, description, deadline, reward_points = result
+        days_left = (deadline - today).days  # Calculate days left until the deadline
+        formatted_challenges.append({
+            'title': title,
+            'description': description,
+            'progress': progress,
+            'deadline': deadline.strftime('%Y-%m-%d %H:%M'),  # Format deadline
+            'points': reward_points,
+            'daysLeft': days_left
+        })
+
+    return create_response("success", 200, "Accepted challenges retrieved successfully", formatted_challenges)
+
+
+@app.route('/completed_challenges/<int:userId>', methods=['GET'])
+def get_completed_challenges_for_user(userId):
+    # Perform an inner join between AcceptedChallenge and Challenge
+    results = db.session.query(
+        Challenge.title,
+        Challenge.description,
+        Challenge.deadline,
+        Challenge.reward_points
+    ).select_from(AcceptedChallenge).join(Challenge, AcceptedChallenge.challengeId == Challenge.challengeId) \
+     .filter(
+         AcceptedChallenge.userId == userId,  # Filter by userId
+         AcceptedChallenge.completed == True  # Only show completed challenges
+     ).all()
+
+    # Format the response
+    formatted_challenges = []
+    for result in results:
+        title, description, deadline, reward_points = result
+        formatted_challenges.append({
+            'title': title,
+            'description': description,
+            'completedOn': deadline.strftime('%d %b %Y'),  # Format deadline as '20 Apr 2025'
+            'points': reward_points
+        })
+
+    return create_response("success", 200, "Completed challenges retrieved successfully", formatted_challenges)
+
+
+
+@app.route('/incompleted_challenges/<int:userId>', methods=['GET'])
+def get_incompleted_challenges_for_user(userId):
+    today = datetime.today()
+    # Perform an inner join between AcceptedChallenge and Challenge
+    results = db.session.query(
+        Challenge.title,
+        Challenge.description,
+        Challenge.deadline,
+        Challenge.reward_points
+    ).join(Challenge, AcceptedChallenge.challengeId == Challenge.challengeId) \
+     .filter(
+         AcceptedChallenge.userId == userId,  # Filter by userId
+         Challenge.deadline < today,
+         AcceptedChallenge.completed == False  # Only show completed challenges
+     ).all()
+
+    # Format the response
+    formatted_challenges = []
+    for result in results:
+        title, description, deadline, reward_points = result
+        formatted_challenges.append({
+            'title': title,
+            'description': description,
+            'completedOn': deadline.strftime('%d %b %Y'),  # Format deadline as '20 Apr 2025'
+            'points': reward_points
+        })
+
+    return create_response("success", 200, "Completed challenges retrieved successfully", formatted_challenges)
 
 
 @app.route('/accepted_challenges', methods=['POST'])
 def add_accepted_challenge():
-    # Extract parameters from the request
-    challengeId = request.form.get('challengeId', type=int)
-    userId = request.form.get('userId', type=int)
-    progress = request.form.get('progress', type=int, default=0)
-    deadline_reached = request.form.get('deadline_reached', type=bool, default=False)
-    accepted_date = request.form.get('accepted_date')  # Optional, in ISO format
+    # Check if the request is JSON
+    if not request.is_json:
+        return create_response("error", 415, "Content-Type must be application/json")
+
+    # Parse the JSON request body
+    data = request.get_json()
+
+    # Extract parameters from the JSON body
+    challengeId = data.get('challengeId')
+    userId = data.get('userId')
 
     # Validate required fields
     if not challengeId or not userId:
         return create_response("error", 400, "Challenge ID and User ID are required")
 
     try:
-        # Convert accepted_date to a datetime object if provided
-        accepted_date = datetime.fromisoformat(accepted_date) if accepted_date else datetime.utcnow()
+        # Set default values
+        progress = 0
+        completed = False
+        accepted_date = datetime.today()  # Use today's date in UTC
 
         # Create a new AcceptedChallenge object
         new_accepted_challenge = AcceptedChallenge(
             challengeId=challengeId,
             userId=userId,
             progress=progress,
-            deadline_reached=deadline_reached,
+            completed=completed,
             accepted_date=accepted_date
         )
         db.session.add(new_accepted_challenge)  # Add the new accepted challenge to the session
@@ -234,7 +366,7 @@ def add_leader_board_entry():
 
     try:
         # Convert last_updated_date to a datetime object if provided
-        last_updated_date = datetime.fromisoformat(last_updated_date) if last_updated_date else datetime.utcnow()
+        last_updated_date = datetime.fromisoformat(last_updated_date) if last_updated_date else datetime.today()
 
         # Create a new LeaderBoard entry
         new_leader_board_entry = LeaderBoard(
@@ -256,7 +388,7 @@ def handle_image():
     import traceback
     from PIL import Image
     # Define the directory where the image will be temporarily saved
-    save_directory = r"C:\Users\progr\OneDrive\Desktop\MealMapperBackend"
+    save_directory = r""
 
     # Check if the request contains a file
     if 'image' not in request.files:
@@ -289,7 +421,7 @@ def handle_image():
                 print(e)
 
         # Load the model and make predictions
-        cnn = tf.keras.models.load_model(r"C:\Users\progr\OneDrive\Desktop\MLdataset\trained_model1.h5")
+        cnn = tf.keras.models.load_model(r"trained_model1.h5")
         imageFinal = tf.keras.preprocessing.image.load_img(file_path, target_size=(64, 64))
         input_arr = tf.keras.preprocessing.image.img_to_array(imageFinal)
         input_arr = np.array([input_arr])  # Convert single image into batch (2D Array)
@@ -297,7 +429,7 @@ def handle_image():
         result_index = np.argmax(predictions)
 
         # Reading Labels
-        with open(r"C:\Users\progr\OneDrive\Desktop\MLdataset\labels.txt") as f:
+        with open(r"labels.txt") as f:
             content = f.readlines()
         label = [i.strip() for i in content]
         result = label[result_index]
