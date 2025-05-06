@@ -1,8 +1,9 @@
 from flask import Flask, jsonify, request
+from flask import Flask, send_from_directory
 from sqlalchemy.exc import IntegrityError
 from config import Config
-from models import db, User,Challenge,AcceptedChallenge,LeaderBoard
-from datetime import date,datetime,timezone
+from models import db, User,Challenge,AcceptedChallenge,LeaderBoard,Food,ScannedHistory
+from datetime import date,datetime,timedelta
 import os
 from werkzeug.utils import secure_filename
 import numpy as np
@@ -442,6 +443,186 @@ def handle_image():
     except Exception as e:
         print(traceback.format_exc())  # Log the full traceback
         return create_response("error", 500, "An error occurred while processing the image", str(e))
+
+
+@app.route('/foods', methods=['POST'])
+def add_food():
+    # Check if the request is JSON
+    if not request.is_json:
+        return create_response("error", 415, "Content-Type must be application/json")
+
+    # Parse the JSON request body
+    data = request.get_json()
+
+    # Extract parameters from the JSON body
+    name = data.get('name')
+    description = data.get('description')
+    calories_per_serving = data.get('calories_per_serving')
+    protein_per_serving = data.get('protein_per_serving', 0)
+    carbs_per_serving = data.get('carbs_per_serving', 0)
+    fat_per_serving = data.get('fat_per_serving', 0)
+    sugar_per_serving = data.get('sugar_per_serving', 0)
+    serving_size = data.get('serving_size', 100)
+    category = data.get('category')
+    meal_type = data.get('meal_type')  # Required field
+    tags = data.get('tags')  # JSON object
+    contents = data.get('contents')  # JSON object
+    recipe = data.get('recipe')  # JSON object
+    image_url = data.get('image_url')
+    popularity_score = data.get('popularity_score', 0)
+
+    # Validate required fields
+    if not name or not calories_per_serving or not meal_type:
+        return create_response("error", 400, "Name, calories per serving, and meal type are required")
+
+    # Validate meal_type
+    valid_meal_types = ['breakfast', 'lunch', 'dinner']
+    if meal_type not in valid_meal_types:
+        return create_response("error", 400, f"Invalid meal type. Must be one of {valid_meal_types}")
+
+    try:
+        # Create a new Food object
+        new_food = Food(
+            name=name,
+            description=description,
+            calories_per_serving=calories_per_serving,
+            protein_per_serving=protein_per_serving,
+            carbs_per_serving=carbs_per_serving,
+            fat_per_serving=fat_per_serving,
+            sugar_per_serving=sugar_per_serving,
+            serving_size=serving_size,
+            category=category,
+            meal_type=meal_type,
+            tags=tags,
+            contents=contents,
+            recipe=recipe,
+            image_url=image_url,
+            popularity_score=popularity_score
+        )
+        db.session.add(new_food)  # Add the new food to the session
+        db.session.commit()  # Commit the transaction to save the food
+        return create_response("success", 201, "Food added successfully", new_food.to_dict())
+
+    except Exception as e:
+        db.session.rollback()  # Rollback the transaction in case of an error
+        return create_response("error", 500, "An error occurred", str(e))
+
+@app.route('/foods/', defaults={'foodname': None})
+@app.route('/foods/<path:foodname>', methods=['GET'])
+def get_food_by_name(foodname):
+    try:
+
+        if not foodname:
+            foods = Food.query.all()
+            formatted_foods = [food.to_dictFind() for food in foods]
+            return create_response(
+                "success", 
+                200, 
+                f"Retrieved all {len(foods)} foods",
+                formatted_foods
+            )
+        
+        # Convert foodname to lowercase for case-insensitive search
+        search_term = foodname.lower()
+        
+        # Query foods where name contains the search term
+        foods = Food.query.filter(Food.name.ilike(f'%{search_term}%')).all()
+        
+        if not foods:
+            return create_response("error", 404, f"No foods found matching '{foodname}'")
+        
+        # Format the response
+        formatted_foods = [food.to_dictFind() for food in foods]
+        
+        return create_response(
+            "success", 
+            200, 
+            f"Found {len(foods)} food(s) matching '{foodname}'",
+            formatted_foods
+        )
+
+    except Exception as e:
+        return create_response("error", 500, "An error occurred while retrieving food information", str(e))
+
+
+@app.route('/scanned_food/<path:userid>', methods=['POST'])
+def add_scanned_food(userid):
+    try:
+        if not request.is_json:
+            return create_response("error", 415, "Content-Type must be application/json")
+
+        data = request.get_json()
+        food_name = data.get('name')
+        serving_size = data.get('serving_size', 100.0)
+        meal_type = data.get('meal_type', '').lower()
+
+        if not food_name:
+            return create_response("error", 400, "Food name is required")
+
+        # If meal_type is empty, determine it based on current time
+        if not meal_type:
+            current_hour = datetime.now().hour
+            if 5 <= current_hour < 11:
+                meal_type = 'breakfast'
+            elif 11 <= current_hour < 16:
+                meal_type = 'lunch'
+            else:
+                meal_type = 'dinner'
+        else:
+            # Validate meal_type if provided
+            valid_meal_types = ['breakfast', 'lunch', 'dinner']
+            if meal_type not in valid_meal_types:
+                return create_response("error", 400, f"Invalid meal type. Must be one of {valid_meal_types}")
+
+        # Find the food by name
+        food = Food.query.filter(Food.name.ilike(food_name.lower())).first()
+        if not food:
+            return create_response("error", 404, f"Food '{food_name}' not found in database")
+        
+        # Check for duplicate entries within last 5 minutes
+        five_minutes_ago = datetime.now() - timedelta(minutes=5)
+        recent_scan = ScannedHistory.query.filter(
+            ScannedHistory.userId == userid,
+            ScannedHistory.foodId == food.foodId,
+            ScannedHistory.scanned_at >= five_minutes_ago
+        ).first()
+
+        if recent_scan:
+            return create_response(
+                "error", 
+                409, 
+                "Duplicate scan detected. Please wait 5 minutes before scanning the same food again.",
+                None
+            )
+        
+        # Create new scanned history entry
+        new_scan = ScannedHistory(
+            userId=userid,
+            foodId=food.foodId,
+            meal_time=meal_type,
+            servings=serving_size,  # Default to 1 serving
+            scanned_at=datetime.today()
+        )
+
+        # Add and commit to database
+        db.session.add(new_scan)
+        db.session.commit()
+
+        return create_response(
+            "success", 
+            201, 
+            "Food scan recorded successfully",
+            new_scan.to_dict()
+        )
+
+    except Exception as e:
+        db.session.rollback()
+        return create_response("error", 500, "An error occurred while recording food scan", str(e))
+
+
+@app.route('/images/<path:filename>', methods=['GET'])
+def serve_image(filename):
+    return send_from_directory('FoodImage', filename)
 
 if __name__ == '__main__':
     with app.app_context():

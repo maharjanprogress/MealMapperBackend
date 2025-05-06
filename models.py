@@ -125,3 +125,93 @@ class LeaderBoard(db.Model):
             'points': self.points,
             'last_updated_date': self.last_updated_date.isoformat() if self.last_updated_date else None
         }
+    
+class Food(db.Model):
+    __tablename__ = 'foods'
+
+    foodId = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False, unique = True)
+    description = db.Column(db.Text)
+    calories_per_serving = db.Column(db.Float, nullable=False)
+    protein_per_serving = db.Column(db.Float, default=0)
+    carbs_per_serving = db.Column(db.Float, default=0)
+    fat_per_serving = db.Column(db.Float, default=0)
+    sugar_per_serving = db.Column(db.Float, default=0)
+    serving_size = db.Column(db.Float(50), default=100) # Default serving size is 100g
+    category = db.Column(db.String(50))
+    meal_type = db.Column(db.String(20), nullable=False)  # ✅ Now required
+    tags = db.Column(JSON)
+    contents = db.Column(JSON)
+    recipe = db.Column(JSON)
+    image_url = db.Column(db.Text)
+    popularity_score = db.Column(db.Float, default=0)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        CheckConstraint(
+            "meal_type IN ('breakfast', 'lunch', 'dinner')",
+            name="valid_meal_type_constraint"
+        ),
+    )
+
+    def to_dict(self):
+        return {
+            'foodId': self.foodId,
+            'name': self.name,
+            'description': self.description,
+            'calories_per_serving': self.calories_per_serving,
+            'protein_per_serving': self.protein_per_serving,
+            'carbs_per_serving': self.carbs_per_serving,
+            'fat_per_serving': self.fat_per_serving,
+            'sugar_per_serving': self.sugar_per_serving,
+            'serving_size': self.serving_size,
+            'category': self.category,
+            'meal_type': self.meal_type,
+            'tags': self.tags,
+            'contents': self.contents,
+            'recipe': self.recipe,
+            'image_url': self.image_url,
+            'popularity_score': self.popularity_score,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+    
+    def to_dictFind(self):
+        return {
+            'name': self.name,
+            'meal_type': self.meal_type,
+            'serving_size': self.serving_size
+        }
+
+class ScannedHistory(db.Model):
+    __tablename__ = 'scanned_history'
+
+    scanId = db.Column(db.Integer, primary_key=True)
+    userId = db.Column(db.Integer, db.ForeignKey('users.userid', ondelete='CASCADE'), nullable=False)
+    foodId = db.Column(db.Integer, db.ForeignKey('foods.foodId', ondelete='CASCADE'), nullable=False)
+    scanned_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    meal_time = db.Column(db.String(20), nullable=False)  # breakfast, lunch, dinner
+    servings = db.Column(db.Float, default=1.0)  # How many servings were consumed
+
+    # Define relationships
+    user = db.relationship('User', backref='scanned_histories', lazy=True)
+    food = db.relationship('Food', backref='scan_records', lazy=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "meal_time IN ('breakfast', 'lunch', 'dinner')",
+            name="valid_meal_time_constraint"
+        ),
+        CheckConstraint("servings > 0", name="valid_servings_constraint"),
+    )
+
+    def to_dict(self):
+        return {
+            'scanId': self.scanId,
+            'userId': self.userId,
+            'foodId': self.foodId,
+            'scanned_at': self.scanned_at.isoformat() if self.scanned_at else None,
+            'meal_time': self.meal_time,
+            'servings': self.servings
+        }
