@@ -24,6 +24,7 @@ class User(db.Model):
     meal_times = db.Column(JSON)
     joindate = db.Column(db.Date)      # Or db.Date if it's just date
     address = db.Column(db.String)
+    lstreak = db.Column(db.Integer, default=0)  # Streak of days user has logged in
 
 
     __table_args__ = (
@@ -48,7 +49,8 @@ class User(db.Model):
             "medical_conditions": self.medical_conditions,
             "meal_times": self.meal_times,
             'joindate': self.joindate.isoformat() if self.joindate else None,
-            'address': self.address
+            'address': self.address,
+            'streak': self.lstreak
 
             # ⚠️ Not including password for security reasons
         }

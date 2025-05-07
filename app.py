@@ -588,13 +588,19 @@ def add_scanned_food(userid):
         ).first()
 
         if recent_scan:
+            streak_data = calculate_streak(userid)
             return create_response(
                 "error", 
-                409, 
+                203, 
                 "Duplicate scan detected. Please wait 5 minutes before scanning the same food again.",
-                None
+                streak_data
             )
         
+        
+        user = db.session.get(User, userid)
+        if not user:
+            return create_response("error", 404, "User not found")
+
         # Create new scanned history entry
         new_scan = ScannedHistory(
             userId=userid,
@@ -608,17 +614,96 @@ def add_scanned_food(userid):
         db.session.add(new_scan)
         db.session.commit()
 
+        # Get scan data and streak information
+        scan_dict = new_scan.to_dict()
+        streak_data = calculate_streak(userid)
+        
+        # Combine the data
+        response_data = {**scan_dict, **streak_data}
+
         return create_response(
             "success", 
             201, 
             "Food scan recorded successfully",
-            new_scan.to_dict()
+            response_data
         )
 
     except Exception as e:
         db.session.rollback()
         return create_response("error", 500, "An error occurred while recording food scan", str(e))
 
+
+@app.route('/home/<path:userid>', methods=['GET'])
+def get_home_data(userid):
+    try:
+        # Get user and validate
+        user = db.session.get(User, userid)
+        if not user:
+            return create_response("error", 204, "User not found")
+
+        # Calculate streak data
+        streak_data = calculate_streak(userid)
+        
+        # You can add more home data here if needed
+        response_data = {
+            'current_streak': streak_data['current_streak'],
+            'longest_streak': streak_data['longest_streak']
+        }
+
+        return create_response(
+            "success",
+            200,
+            "Home data retrieved successfully",
+            response_data
+        )
+
+    except Exception as e:
+        return create_response("error", 500, "An error occurred while retrieving home data", str(e))
+
+
+def calculate_streak(userid):
+    try:
+        # Calculate current streak
+        today = datetime.today().date()
+        current_streak = 0
+
+        # Get all user's scans ordered by date descending
+        user_scans = ScannedHistory.query.filter(
+            ScannedHistory.userId == userid,
+            ScannedHistory.scanned_at < datetime.today()
+        ).order_by(ScannedHistory.scanned_at.desc()).all()
+
+        if user_scans:
+            # Group scans by date
+            scan_dates = set()
+            for scan in user_scans:
+                scan_dates.add(scan.scanned_at.date())
+            scan_dates = sorted(list(scan_dates), reverse=True)
+
+            # Check for consecutive days
+            for i in range(len(scan_dates)):
+                if scan_dates[i] == today - timedelta(days=i):
+                    current_streak += 1
+                else:
+                    break
+
+        # Get user and update streak if current is longer
+        user = db.session.get(User, userid)
+        if user and current_streak > (user.lstreak or 0):
+            user.lstreak = current_streak
+            db.session.commit()
+
+       # Create response data dictionary
+        response_data = {
+            'current_streak': current_streak,
+            'longest_streak': user.lstreak if user else 0
+        }
+
+        return response_data
+
+    except Exception as e:
+        db.session.rollback()
+        raise e
 
 @app.route('/images/<path:filename>', methods=['GET'])
 def serve_image(filename):
