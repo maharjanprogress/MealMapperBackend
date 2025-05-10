@@ -617,6 +617,7 @@ def add_scanned_food(userid):
         # Get scan data and streak information
         scan_dict = new_scan.to_dict()
         streak_data = calculate_streak(userid)
+        update_challenge_progress(food.foodId, meal_type, serving_size, userid)
         
         # Combine the data
         response_data = {**scan_dict, **streak_data}
@@ -660,6 +661,329 @@ def get_home_data(userid):
     except Exception as e:
         return create_response("error", 500, "An error occurred while retrieving home data", str(e))
 
+
+@app.route('/profile/<int:userid>', methods=['GET'])
+def get_user_profile(userid):
+    try:
+        profile_data = get_profile(userid)
+        if profile_data is None:
+            return create_response("error", 404, "User not found")
+            
+        return create_response(
+            "success",
+            200,
+            "Profile data retrieved successfully",
+            profile_data
+        )
+    except Exception as e:
+        return create_response("error", 500, "Error retrieving profile data", str(e))
+
+
+@app.route('/update_profile/<int:userid>', methods=['PUT'])
+def update_user_profile(userid):
+    try:
+        # Check if request is JSON
+        if not request.is_json:
+            return create_response("error", 415, "Content-Type must be application/json")
+
+        # Get user
+        user = db.session.get(User, userid)
+        if not user:
+            return create_response("error", 404, "User not found")
+
+        # Get JSON data
+        data = request.get_json()
+        updates_made = []
+
+        # Update email if provided
+        if 'account_email' in data:
+            user.email = data['account_email']
+            updates_made.append('email')
+
+        # Update username if provided
+        if 'account_username' in data:
+            user.username = data['account_username']
+            updates_made.append('username')
+
+        # Update password if provided
+        if 'password' in data:
+            user.password = data['password']
+            updates_made.append('password')
+
+        # Update activity level if provided
+        if 'health_activity_level' in data:
+            activity_level_map = {'Not Active': -1, 'Moderate': 0, 'Very Active': 1}
+            activity_level = activity_level_map.get(data['health_activity_level'])
+            if activity_level is not None:
+                user.activity_level = activity_level
+                updates_made.append('activity_level')
+            else:
+                return create_response("error", 400, "Invalid activity level value")
+
+        # Update goal if provided
+        if 'health_goal' in data:
+            goal_map = {'Go Slim': -1, 'Maintain': 0, 'Gain Weight': 1}
+            goal = goal_map.get(data['health_goal'])
+            if goal is not None:
+                user.goal = goal
+                updates_made.append('goal')
+            else:
+                return create_response("error", 400, "Invalid goal value")
+
+        # Update dietary preference if provided
+        if 'meal_dietary_pref' in data:
+            user.dietary_pref = data['meal_dietary_pref']
+            updates_made.append('dietary_preference')
+
+        # Update meal times if provided
+        meal_times_updated = False
+        current_meal_times = user.meal_times or {}
+
+        if 'meal_breakfast_time' in data:
+            current_meal_times['breakfast'] = data['meal_breakfast_time']
+            meal_times_updated = True
+
+        if 'meal_lunch_time' in data:
+            current_meal_times['lunch'] = data['meal_lunch_time']
+            meal_times_updated = True
+
+        if 'meal_dinner_time' in data:
+            current_meal_times['dinner'] = data['meal_dinner_time']
+            meal_times_updated = True
+
+        if meal_times_updated:
+            user.meal_times = current_meal_times
+            updates_made.append('meal_times')
+
+        # Commit changes if any updates were made
+        if updates_made:
+            try:
+                db.session.commit()
+                return create_response(
+                    "success",
+                    200,
+                    "Profile updated successfully",
+                    {
+                        "user": user.to_dict()
+                    }
+                )
+            except IntegrityError:
+                db.session.rollback()
+                return create_response("error", 409, "Username or email already exists")
+        else:
+            return create_response("error", 400, "No valid fields provided for update")
+
+    except Exception as e:
+        db.session.rollback()
+        return create_response("error", 500, "An error occurred while updating profile", str(e))
+
+
+def update_challenge_progress(foodid, meal_time, serving_size, userid):
+    try:
+        # Get current time for deadline comparison
+        current_time = datetime.now()
+
+        # Get user's accepted challenges that haven't passed deadline
+        active_challenges = db.session.query(AcceptedChallenge, Challenge).join(
+            Challenge,
+            AcceptedChallenge.challengeId == Challenge.challengeId
+        ).filter(
+            AcceptedChallenge.userId == userid,
+            AcceptedChallenge.completed == False,
+            Challenge.deadline > current_time
+        ).all()
+
+        # Get the scanned food details using Session.get() instead of Query.get()
+        food = db.session.get(Food, foodid)
+        if not food:
+            return
+
+        # Calculate actual nutritional values based on serving size
+        serving_ratio = serving_size / float(food.serving_size)
+        actual_protein = food.protein_per_serving * serving_ratio
+        actual_carbs = food.carbs_per_serving * serving_ratio
+        actual_calories = food.calories_per_serving * serving_ratio
+        print(actual_protein, actual_carbs, actual_calories,serving_ratio)
+
+        # Process each active challenge
+        for accepted, challenge in active_challenges:
+            requirements = challenge.requirements
+            progress_updated = False
+
+            # Calculate progress based on nutritional requirements
+            if 'required_protein' in requirements:
+                required_protein = requirements['required_protein']
+                protein_progress = (actual_protein / required_protein) * 100
+                accepted.progress = min(100, int(accepted.progress + protein_progress))
+                progress_updated = True
+
+            if 'required_calories' in requirements:
+                required_calories = requirements['required_calories']
+                calorie_progress = (actual_calories / required_calories) * 100
+                accepted.progress = min(100, int(accepted.progress + calorie_progress))
+                progress_updated = True
+
+            if 'required_carbs' in requirements:
+                required_carbs = requirements['required_carbs']
+                carbs_progress = (actual_carbs / required_carbs) * 100
+                accepted.progress = min(100, int(accepted.progress + carbs_progress))
+                progress_updated = True
+
+            # Update challenge completion status
+            if accepted.progress >= 100:
+                accepted.completed = True
+                accepted.progress = 100
+                
+                # Update leaderboard
+                current_season = f"{current_time.year}-Q{(current_time.month-1)//3 + 1}"
+                leaderboard = LeaderBoard.query.filter_by(
+                    userId=userid,
+                    season=current_season
+                ).first()
+                
+                if not leaderboard:
+                    leaderboard = LeaderBoard(
+                        userId=userid,
+                        season=current_season,
+                        points=0
+                    )
+                    db.session.add(leaderboard)
+                
+                leaderboard.points += challenge.reward_points
+                leaderboard.last_updated_date = current_time
+
+            if progress_updated:
+                db.session.commit()
+
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error updating challenge progress: {e}")
+        raise e
+
+
+def get_profile(userid):
+    try:
+        # Get the user
+        user = db.session.get(User, userid)
+        if not user:
+            return None
+
+        # Get today's date and date 7 days ago
+        today = datetime.now().date()
+        week_ago = today - timedelta(days=6)
+        
+        # Get all calories for the past 7 days in one query
+        daily_calories = db.session.query(
+            db.func.date(ScannedHistory.scanned_at).label('date'),
+            db.func.sum(Food.calories_per_serving * ScannedHistory.servings).label('calories')
+        ).join(
+            Food, Food.foodId == ScannedHistory.foodId
+        ).filter(
+            ScannedHistory.userId == userid,
+            ScannedHistory.scanned_at >= week_ago
+        ).group_by(
+            db.func.date(ScannedHistory.scanned_at)
+        ).all()
+
+        # Create a dictionary to store calories by date
+        calories_by_date = {str(date): float(calories or 0) for date, calories in daily_calories}
+
+        # Create ordered weekly calories with dates
+        weekly_calories = []
+        current_date = week_ago
+        while current_date <= today:
+            date_str = current_date.strftime('%Y-%m-%d')  # Format: YYYY-MM-DD
+            calories = calories_by_date.get(str(current_date), 0.0)
+            weekly_calories.append((date_str, calories))
+            current_date += timedelta(days=1)
+
+        # Convert to ordered dict
+        from collections import OrderedDict
+        ordered_weekly_calories = OrderedDict(weekly_calories)
+
+        # Get today's macros
+        today_macros = db.session.query(
+            db.func.sum(Food.protein_per_serving * ScannedHistory.servings),
+            db.func.sum(Food.carbs_per_serving * ScannedHistory.servings),
+            db.func.sum(Food.fat_per_serving * ScannedHistory.servings)
+        ).join(
+            ScannedHistory, Food.foodId == ScannedHistory.foodId
+        ).filter(
+            ScannedHistory.userId == userid,
+            db.func.date(ScannedHistory.scanned_at) == today
+        ).first()
+
+        # Get current season's points and completed challenges
+        current_season = f"{today.year}-Q{(today.month-1)//3 + 1}"
+        leaderboard = LeaderBoard.query.filter_by(
+            userId=userid,
+            season=current_season
+        ).first()
+
+        completed_challenges = AcceptedChallenge.query.filter_by(
+            userId=userid,
+            completed=True
+        ).count()
+
+        # Compile profile data
+        profile_data = {
+            'personal_info': {
+                'age': current_age(userid),
+                'gender': user.gender,
+                'height_cm': user.height_cm,
+                'weight_kg': user.weight_kg,
+                'activity_level': user.activity_level,
+                'goal': user.goal,
+                'dietary_pref': user.dietary_pref,
+                'allergies': user.allergies,
+                'medical_conditions': user.medical_conditions,
+                'meal_times': user.meal_times,
+                'address': user.address
+            },
+            'weekly_calories': ordered_weekly_calories,
+            'today_macros': {
+                'protein': float(today_macros[0] or 0),
+                'carbs': float(today_macros[1] or 0),
+                'fat': float(today_macros[2] or 0)
+            },
+            'achievements': {
+                'season_points': leaderboard.points if leaderboard else 0,
+                'completed_challenges': completed_challenges
+            }
+        }
+
+        return profile_data
+
+    except Exception as e:
+        print(f"Error in get_profile: {str(e)}")
+        return None
+
+def current_age(userid):
+    try:
+        # Get the user
+        user = db.session.get(User, userid)
+        if not user:
+            return None
+
+        # Get today's date
+        today = datetime.today().date()
+
+        # Get stored age and join date
+        stored_age = user.age  # Age when user joined
+        join_date = user.joindate
+
+        if join_date:
+            # Calculate years passed since joining
+            years_passed = today.year - join_date.year - ((today.month, today.day) < (join_date.month, join_date.day))
+            # Current age is stored age plus years passed
+            current_age = stored_age + years_passed
+            return current_age
+        else:
+            return stored_age  # Return stored age if no join date
+
+    except Exception as e:
+        print(f"Error in current_age: {str(e)}")
+        return None
 
 def calculate_streak(userid):
     try:
