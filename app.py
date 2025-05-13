@@ -83,7 +83,7 @@ def add_user():
     weight_kg = data.get('weight_kg')
     activity_level = data.get('activity_level')
     goal = data.get('goal')
-    dietary_pref = data.get('dietary_pref')
+    dietary_pref = data.get('dietary_pref', 'Any') or 'Any'  # Returns 'Any' if value is None or empty
     allergies = data.get('allergies')  # List of strings
     medical_conditions = data.get('medical_conditions')  # List of strings
     meal_times = data.get('meal_times')  # JSON object
@@ -131,7 +131,7 @@ def add_user():
 
     except IntegrityError:
         db.session.rollback()  # Rollback the transaction in case of an error
-        return create_response("error", 400, "Username or email already exists")
+        return create_response("error", 206, "Username or email already exists")
 
     except Exception as e:
         db.session.rollback()  # Rollback the transaction in case of an error
@@ -778,6 +778,32 @@ def update_user_profile(userid):
         return create_response("error", 500, "An error occurred while updating profile", str(e))
 
 
+@app.route('/leaderboard/season/<int:userid>', methods=['GET'])
+def season_leaderboard(userid):
+    try:
+        rankings = get_this_season_leaderboards(userid)
+        return create_response("success", 200, "Season leaderboard retrieved successfully", rankings)
+    except Exception as e:
+        return create_response("error", 500, "Error retrieving season leaderboard", str(e))
+
+@app.route('/leaderboard/week/<int:userid>', methods=['GET'])
+def week_leaderboard(userid):
+    try:
+        rankings = get_this_week_leaderboards(userid)
+        return create_response("success", 200, "Weekly leaderboard retrieved successfully", rankings)
+    except Exception as e:
+        return create_response("error", 500, "Error retrieving weekly leaderboard", str(e))
+
+@app.route('/leaderboard/month/<int:userid>', methods=['GET'])
+def month_leaderboard(userid):
+    try:
+        rankings = get_this_month_leaderboards(userid)
+        return create_response("success", 200, "Monthly leaderboard retrieved successfully", rankings)
+    except Exception as e:
+        return create_response("error", 500, "Error retrieving monthly leaderboard", str(e))
+
+
+
 def update_challenge_progress(foodid, meal_time, serving_size, userid):
     try:
         # Get current time for deadline comparison
@@ -989,27 +1015,33 @@ def calculate_streak(userid):
     try:
         # Calculate current streak
         today = datetime.today().date()
+        yesterday = today - timedelta(days=1)
         current_streak = 0
 
         # Get all user's scans ordered by date descending
         user_scans = ScannedHistory.query.filter(
-            ScannedHistory.userId == userid,
-            ScannedHistory.scanned_at < datetime.today()
+            ScannedHistory.userId == userid
         ).order_by(ScannedHistory.scanned_at.desc()).all()
 
-        if user_scans:
-            # Group scans by date
-            scan_dates = set()
-            for scan in user_scans:
-                scan_dates.add(scan.scanned_at.date())
-            scan_dates = sorted(list(scan_dates), reverse=True)
+        if not user_scans:
+            return {'current_streak': 0, 'longest_streak': 0}
 
-            # Check for consecutive days
-            for i in range(len(scan_dates)):
-                if scan_dates[i] == today - timedelta(days=i):
-                    current_streak += 1
-                else:
-                    break
+        # Group scans by date
+        scan_dates = set()
+        for scan in user_scans:
+            scan_dates.add(scan.scanned_at.date())
+        scan_dates = sorted(list(scan_dates), reverse=True)
+
+        # Initialize streak
+        current_streak = 1
+        latest_date = scan_dates[0]
+
+        # Check for consecutive days
+        for i in range(1, len(scan_dates)):
+            if (scan_dates[i-1] - scan_dates[i]).days == 1:
+                current_streak += 1
+            else:
+                break
 
         # Get user and update streak if current is longer
         user = db.session.get(User, userid)
@@ -1017,7 +1049,7 @@ def calculate_streak(userid):
             user.lstreak = current_streak
             db.session.commit()
 
-       # Create response data dictionary
+        # Create response data dictionary
         response_data = {
             'current_streak': current_streak,
             'longest_streak': user.lstreak if user else 0
@@ -1027,7 +1059,135 @@ def calculate_streak(userid):
 
     except Exception as e:
         db.session.rollback()
+        print(f"Error in calculate_streak: {str(e)}")
         raise e
+    
+
+def get_this_season_leaderboards(userid):
+    try:
+        # Get current season
+        today = datetime.today()
+        current_season = f"{today.year}-Q{(today.month-1)//3 + 1}"
+
+        # Get all users' points for current season
+        leaderboard_data = db.session.query(
+            LeaderBoard.userId,
+            LeaderBoard.points,
+            User.username
+        ).join(
+            User, LeaderBoard.userId == User.userid
+        ).filter(
+            LeaderBoard.season == current_season
+        ).order_by(
+            LeaderBoard.points.desc()
+        ).all()
+
+        # Format response
+        rankings = []
+        for rank, (user_id, points, username) in enumerate(leaderboard_data, 1):
+            rankings.append({
+                'rank': rank,
+                'username': username,
+                'points': points,
+                'isCurrentUser': user_id == userid
+            })
+
+        return rankings
+
+    except Exception as e:
+        print(f"Error in get_this_season_leaderboards: {str(e)}")
+        return []
+
+
+def get_this_week_leaderboards(userid):
+    try:
+        # Get start and end of current week
+        today = datetime.today()
+        start_of_week = today - timedelta(days=today.weekday())
+        print(today.weekday())
+        print(start_of_week)
+        end_of_week = start_of_week + timedelta(days=6)
+        print(end_of_week)
+
+        # Get points accumulated this week
+        leaderboard_data = db.session.query(
+            AcceptedChallenge.userId,
+            db.func.sum(Challenge.reward_points).label('points'),
+            User.username
+        ).join(
+            Challenge, AcceptedChallenge.challengeId == Challenge.challengeId
+        ).join(
+            User, AcceptedChallenge.userId == User.userid
+        ).filter(
+            AcceptedChallenge.completed == True,
+            db.func.date(AcceptedChallenge.accepted_date) >= start_of_week.date(),
+            db.func.date(AcceptedChallenge.accepted_date) <= end_of_week.date()
+        ).group_by(
+            AcceptedChallenge.userId,
+            User.username
+        ).order_by(
+            db.func.sum(Challenge.reward_points).desc()
+        ).all()
+
+        # Format response
+        rankings = []
+        for rank, (user_id, points, username) in enumerate(leaderboard_data, 1):
+            rankings.append({
+                'rank': rank,
+                'username': username,
+                'points': int(points or 0),
+                'isCurrentUser': user_id == userid
+            })
+
+        return rankings
+
+    except Exception as e:
+        print(f"Error in get_this_week_leaderboards: {str(e)}")
+        return []
+
+def get_this_month_leaderboards(userid):
+    try:
+        # Get start and end of current month
+        today = datetime.today()
+        start_of_month = today.replace(day=1)
+        next_month = today.replace(day=28) + timedelta(days=4)
+        end_of_month = next_month - timedelta(days=next_month.day)
+
+        # Get points accumulated this month
+        leaderboard_data = db.session.query(
+            AcceptedChallenge.userId,
+            db.func.sum(Challenge.reward_points).label('points'),
+            User.username
+        ).join(
+            Challenge, AcceptedChallenge.challengeId == Challenge.challengeId
+        ).join(
+            User, AcceptedChallenge.userId == User.userid
+        ).filter(
+            AcceptedChallenge.completed == True,
+            db.func.date(AcceptedChallenge.accepted_date) >= start_of_month.date(),
+            db.func.date(AcceptedChallenge.accepted_date) <= end_of_month.date()
+        ).group_by(
+            AcceptedChallenge.userId,
+            User.username
+        ).order_by(
+            db.func.sum(Challenge.reward_points).desc()
+        ).all()
+
+        # Format response
+        rankings = []
+        for rank, (user_id, points, username) in enumerate(leaderboard_data, 1):
+            rankings.append({
+                'rank': rank,
+                'username': username,
+                'points': int(points or 0),
+                'isCurrentUser': user_id == userid
+            })
+
+        return rankings
+
+    except Exception as e:
+        print(f"Error in get_this_month_leaderboards: {str(e)}")
+        return []
 
 @app.route('/images/<path:filename>', methods=['GET'])
 def serve_image(filename):
