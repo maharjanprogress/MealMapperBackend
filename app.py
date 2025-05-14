@@ -4,6 +4,7 @@ from sqlalchemy.exc import IntegrityError
 from config import Config
 from models import db, User,Challenge,AcceptedChallenge,LeaderBoard,Food,ScannedHistory
 from datetime import date,datetime,timedelta
+from dateutil.relativedelta import relativedelta
 import os
 from werkzeug.utils import secure_filename
 import numpy as np
@@ -802,7 +803,91 @@ def month_leaderboard(userid):
     except Exception as e:
         return create_response("error", 500, "Error retrieving monthly leaderboard", str(e))
 
+@app.route('/scanned_details/<int:userid>/<int:months_back>', methods=['GET'])
+def get_user_scanned_details(userid, months_back):
+    try:
+        scanned_details = get_scanned_details(userid, months_back)
+        if not scanned_details:
+            return create_response("success", 200, "No scanned foods found for the specified month", [])
+            
+        return create_response(
+            "success",
+            200,
+            f"Scanned food details retrieved successfully for {months_back} months ago",
+            scanned_details
+        )
+    except Exception as e:
+        return create_response("error", 500, "Error retrieving scanned food details", str(e))
 
+def get_scanned_details(userid, months_back):
+    try:
+        # Calculate start and end dates for the requested month
+        today = datetime.today()
+        if months_back == 0:
+            # For current month
+            start_date = today.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            if today.month == 12:
+                end_date = today.replace(day=31, hour=23, minute=59, second=59, microsecond=999999)
+            else:
+                next_month = today.replace(day=1) + relativedelta(months=1)
+                end_date = (next_month - timedelta(days=1)).replace(hour=23, minute=59, second=59, microsecond=999999)
+        else:
+            # For previous months
+            start_date = (today.replace(day=1) - relativedelta(months=months_back)).replace(hour=0, minute=0, second=0, microsecond=0)
+            end_date = (start_date + relativedelta(months=1) - timedelta(days=1)).replace(hour=23, minute=59, second=59, microsecond=999999)
+
+
+        # Get all scans for the specified month with food details
+        scans = db.session.query(
+            ScannedHistory,
+            Food
+        ).join(
+            Food, ScannedHistory.foodId == Food.foodId
+        ).filter(
+            ScannedHistory.userId == userid,
+            db.func.date(ScannedHistory.scanned_at) >= start_date,
+            db.func.date(ScannedHistory.scanned_at) <= end_date
+        ).order_by(
+            ScannedHistory.scanned_at.desc()
+        ).all()
+
+        # Organize scans by date
+        scanned_details = {}
+        for scan, food in scans:
+            scan_date = scan.scanned_at.strftime('%Y-%m-%d')
+            
+            if scan_date not in scanned_details:
+                scanned_details[scan_date] = []
+            
+            # Create food details dictionary
+            food_details = {
+                'name': food.name,
+                'meal_type': scan.meal_time,
+                'scanned_at': scan.scanned_at.strftime('%H:%M'),
+                'servings': scan.servings,
+                'calories': food.calories_per_serving * scan.servings,
+                'protein': food.protein_per_serving * scan.servings,
+                'carbs': food.carbs_per_serving * scan.servings,
+                'fat': food.fat_per_serving * scan.servings,
+                'category': food.category
+            }
+            
+            scanned_details[scan_date].append(food_details)
+
+        # Convert to list of dictionaries sorted by date
+        formatted_response = [
+            {
+                'date': date,
+                'food_details': details
+            }
+            for date, details in sorted(scanned_details.items(), reverse=True)
+        ]
+
+        return formatted_response
+
+    except Exception as e:
+        print(f"Error in get_scanned_details: {str(e)}")
+        return []
 
 def update_challenge_progress(foodid, meal_time, serving_size, userid):
     try:
@@ -1014,34 +1099,60 @@ def current_age(userid):
 def calculate_streak(userid):
     try:
         # Calculate current streak
-        today = datetime.today().date()
+        now = datetime.today()
+        today = now.date()
         yesterday = today - timedelta(days=1)
         current_streak = 0
 
+        # Check if user has scanned anything today
+        today_scan = ScannedHistory.query.filter(
+            ScannedHistory.userId == userid,
+            db.func.date(ScannedHistory.scanned_at) == today
+        ).first()
+
         # Get all user's scans ordered by date descending
         user_scans = ScannedHistory.query.filter(
-            ScannedHistory.userId == userid
+            ScannedHistory.userId == userid,
+            ScannedHistory.scanned_at < datetime.today()
         ).order_by(ScannedHistory.scanned_at.desc()).all()
 
-        if not user_scans:
-            return {'current_streak': 0, 'longest_streak': 0}
+        if user_scans:
+            # Group scans by date
+            scan_dates = set()
+            for scan in user_scans:
+                scan_dates.add(scan.scanned_at.date())
+            scan_dates = sorted(list(scan_dates), reverse=True)
 
-        # Group scans by date
-        scan_dates = set()
-        for scan in user_scans:
-            scan_dates.add(scan.scanned_at.date())
-        scan_dates = sorted(list(scan_dates), reverse=True)
-
-        # Initialize streak
-        current_streak = 1
-        latest_date = scan_dates[0]
-
-        # Check for consecutive days
-        for i in range(1, len(scan_dates)):
-            if (scan_dates[i-1] - scan_dates[i]).days == 1:
-                current_streak += 1
+            if today_scan:
+            # If there's a scan today, calculate consecutive days normally
+                current_streak = 1
+                for i in range(len(scan_dates) - 1):  # -1 because we already counted today
+                    if scan_dates[i+1] == today - timedelta(days=i+1):
+                        current_streak += 1
+                    else:
+                        break
             else:
-                break
+                # If no scan today, check yesterday's scan
+                yesterday_scan = next((scan for scan in user_scans if scan.scanned_at.date() == yesterday), None)
+                
+                if yesterday_scan:
+                    # Calculate hours passed since last scan
+                    hours_passed = (now - yesterday_scan.scanned_at).total_seconds() / 3600
+                    
+                    if hours_passed <= 24:
+                        # Less than 24 hours passed, start counting from yesterday
+                        current_streak = 1
+                        for i in range(len(scan_dates) - 1):
+                            if scan_dates[i+1] == yesterday - timedelta(days=i):
+                                current_streak += 1
+                            else:
+                                break
+                    else:
+                        # More than 24 hours passed, reset streak
+                        current_streak = 0
+                else:
+                    # No scan yesterday, streak is 0
+                    current_streak = 0
 
         # Get user and update streak if current is longer
         user = db.session.get(User, userid)
@@ -1049,7 +1160,7 @@ def calculate_streak(userid):
             user.lstreak = current_streak
             db.session.commit()
 
-        # Create response data dictionary
+       # Create response data dictionary
         response_data = {
             'current_streak': current_streak,
             'longest_streak': user.lstreak if user else 0
