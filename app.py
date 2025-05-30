@@ -16,7 +16,6 @@ app.config.from_object(Config)
 db.init_app(app)
 
 
-# Initialize the database
 
 def create_response(status, code, message, details=None):
     """
