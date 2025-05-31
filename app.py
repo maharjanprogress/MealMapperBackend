@@ -2,7 +2,7 @@ from flask import Flask, jsonify, request
 from flask import Flask, send_from_directory
 from sqlalchemy.exc import IntegrityError
 from config import Config
-from models import db, User,Challenge,AcceptedChallenge,LeaderBoard,Food,ScannedHistory
+from models import db, User,Challenge,AcceptedChallenge,LeaderBoard,Food,ScannedHistory, Ingredient, Allergen
 from datetime import date,datetime,timedelta
 from dateutil.relativedelta import relativedelta
 import os
@@ -28,6 +28,27 @@ def create_response(status, code, message, details=None):
         "details": details
     }), code
 
+def normalize_string_list(input_list):
+    """
+    Normalizes a list of strings:
+    - Converts items to lowercase and strips whitespace.
+    - Removes "none" (case-insensitive) and empty strings.
+    - Returns an empty list if input is None, not a list, 
+      or results in an empty list after processing.
+    """
+    if not isinstance(input_list, list):
+        return []  # Return empty list if input is not a list or None
+
+    processed_list = []
+    for item in input_list:
+        if isinstance(item, str):
+            cleaned_item = item.lower().strip()
+            if cleaned_item and cleaned_item != 'none':  # Add if not empty and not "none"
+                processed_list.append(cleaned_item)
+        # else:
+            # Optionally, log or handle non-string items if they are unexpected
+            # print(f"Warning: Non-string item '{item}' found in list, skipping.")
+    return processed_list
 
 @app.route('/login', methods=['POST'])
 def login():
@@ -84,9 +105,9 @@ def add_user():
     weight_kg = data.get('weight_kg')
     activity_level = data.get('activity_level')
     goal = data.get('goal')
-    dietary_pref = data.get('dietary_pref', 'Any') or 'Any'  # Returns 'Any' if value is None or empty
-    allergies = data.get('allergies')  # List of strings
-    medical_conditions = data.get('medical_conditions')  # List of strings
+    dietary_pref_raw = data.get('dietary_pref') # Defaulting later
+    allergies_raw = data.get('allergies')  # List of strings
+    medical_conditions_raw = data.get('medical_conditions')  # List of strings
     meal_times = data.get('meal_times')  # JSON object
     address = data.get('address')
 
@@ -107,6 +128,10 @@ def add_user():
     if gender is None or activity_level is None or goal is None:
         return create_response("error", 400, "Invalid value for gender, activity_level, or goal")
 
+    # Normalize and set defaults
+    allergies = normalize_string_list(allergies_raw)
+    medical_conditions = normalize_string_list(medical_conditions_raw)
+    dietary_pref = (dietary_pref_raw.lower().strip() if isinstance(dietary_pref_raw, str) and dietary_pref_raw.strip() else 'any')
     try:
         # Create a new User object
         new_user = User(
@@ -507,6 +532,190 @@ def add_food():
     except Exception as e:
         db.session.rollback()  # Rollback the transaction in case of an error
         return create_response("error", 500, "An error occurred", str(e))
+
+@app.route('/allergens', methods=['GET'])
+def get_all_allergens():
+    try:
+        allergens = Allergen.query.order_by(Allergen.name).all()
+        # Using the to_dict method to get more details, or just names if preferred
+        allergen_details = [allergen.to_dict() for allergen in allergens]
+        # If you only want names:
+        # allergen_names = [allergen.name for allergen in allergens]
+        return create_response("success", 200, "Allergens retrieved successfully", allergen_details)
+    except Exception as e:
+        return create_response("error", 500, "An error occurred while retrieving allergens", str(e))
+
+@app.route('/allergens', methods=['POST'])
+def add_allergen():
+    if not request.is_json:
+        return create_response("error", 415, "Content-Type must be application/json")
+
+    data = request.get_json()
+    name = data.get('name')
+    description = data.get('description', None) # Optional description
+    ingredient_names_raw = data.get('ingredients', []) # Expects a list of ingredient names
+
+    if not name or not name.strip():
+        return create_response("error", 400, "Allergen name is required")
+
+    allergen_name_stripped = name.strip()
+    allergen_name_lower = allergen_name_stripped.lower()
+
+    # Case-insensitive check for existing allergen
+    existing_allergen = Allergen.query.filter(db.func.lower(Allergen.name) == allergen_name_lower).first()
+    if existing_allergen:
+        return create_response("error", 409, f"Allergen '{allergen_name_stripped}' already exists.", existing_allergen.to_dict())
+
+    try:
+        new_allergen = Allergen(name=allergen_name_stripped, description=description)
+        db.session.add(new_allergen)
+
+        processed_ingredient_names = normalize_string_list(ingredient_names_raw)
+        associated_ingredients_count = 0
+        unknown_ingredients_input = []
+
+        if processed_ingredient_names:
+            for ingredient_name_norm in processed_ingredient_names:
+                # Case-insensitive check for existing ingredient
+                ingredient_obj = Ingredient.query.filter(db.func.lower(Ingredient.name) == ingredient_name_norm).first()
+                if ingredient_obj:
+                    new_allergen.ingredients.append(ingredient_obj) # SQLAlchemy handles the association table
+                    associated_ingredients_count += 1
+                else:
+                    # Find the original casing for the unknown ingredient name for reporting
+                    original_unknown_name = next((raw_name for raw_name in ingredient_names_raw if isinstance(raw_name, str) and raw_name.lower().strip() == ingredient_name_norm), ingredient_name_norm)
+                    unknown_ingredients_input.append(original_unknown_name)
+        
+        db.session.commit()
+
+        response_message = f"Allergen '{new_allergen.name}' added successfully."
+        details = new_allergen.to_dict()
+        if unknown_ingredients_input:
+            response_message += f" {associated_ingredients_count} ingredient(s) associated."
+            details['warnings'] = {
+                "unknown_ingredients_provided": unknown_ingredients_input,
+                "note": "These ingredient names were provided but not found in the database and were not associated."
+            }
+        return create_response("success", 201, response_message, details)
+
+    except Exception as e:
+        db.session.rollback()
+        return create_response("error", 500, "An error occurred while adding the allergen", str(e))
+
+@app.route('/ingredients/', defaults={'ingredient_name': None}, methods=['GET'])
+@app.route('/ingredients/<path:ingredient_name>', methods=['GET'])
+def get_ingredients_by_name(ingredient_name):
+    try:
+        if not ingredient_name:
+            ingredients = Ingredient.query.order_by(Ingredient.name).all()
+            ingredient_names = [ingredient.name for ingredient in ingredients]
+            return create_response(
+                "success",
+                200,
+                f"Retrieved all {len(ingredients)} ingredients",
+                ingredient_names
+            )
+
+        search_term = ingredient_name.lower()
+        ingredients = Ingredient.query.filter(Ingredient.name.ilike(f'%{search_term}%')).order_by(Ingredient.name).all()
+
+        if not ingredients:
+            return create_response("error", 404, f"No ingredients found matching '{ingredient_name}'")
+
+        ingredient_names = [ingredient.name for ingredient in ingredients]
+        return create_response(
+            "success",
+            200,
+            f"Found {len(ingredients)} ingredient(s) matching '{ingredient_name}'",
+            ingredient_names
+        )
+    except Exception as e:
+        return create_response("error", 500, "An error occurred while retrieving ingredients", str(e))
+
+@app.route('/allergens/', defaults={'allergen_name': None}, methods=['GET'])
+@app.route('/allergens/<path:allergen_name>', methods=['GET'])
+def get_allergens_by_name(allergen_name):
+    try:
+        if not allergen_name:
+            allergens = Allergen.query.order_by(Allergen.name).all()
+            allergen_names = [allergen.name for allergen in allergens]
+            return create_response("success", 200, f"Retrieved all {len(allergens)} allergens", allergen_names)
+
+        search_term = allergen_name.lower()
+        allergens = Allergen.query.filter(Allergen.name.ilike(f'%{search_term}%')).order_by(Allergen.name).all()
+
+        if not allergens:
+            return create_response("error", 404, f"No allergens found matching '{allergen_name}'")
+
+        allergen_names = [allergen.name for allergen in allergens]
+        return create_response("success", 200, f"Found {len(allergens)} allergen(s) matching '{allergen_name}'", allergen_names)
+    except Exception as e:
+        return create_response("error", 500, "An error occurred while retrieving allergens", str(e))
+
+@app.route('/ingredients', methods=['GET'])
+def get_all_ingredients():
+    try:
+        ingredients = Ingredient.query.order_by(Ingredient.name).all()
+        ingredient_names = [ingredient.to_dict() for ingredient in ingredients]
+        return create_response("success", 200, "Ingredients retrieved successfully", ingredient_names)
+    except Exception as e:
+        return create_response("error", 500, "An error occurred while retrieving ingredients", str(e))
+
+@app.route('/ingredients', methods=['POST'])
+def add_ingredient():
+    if not request.is_json:
+        return create_response("error", 415, "Content-Type must be application/json")
+
+    data = request.get_json()
+    name = data.get('name')
+    allergen_names_raw = data.get('allergens', []) # Expects a list of allergen names
+
+    if not name or not name.strip():
+        return create_response("error", 400, "Ingredient name is required")
+
+    ingredient_name_stripped = name.strip()
+    ingredient_name_lower = ingredient_name_stripped.lower()
+
+    # Case-insensitive check for existing ingredient
+    existing_ingredient = Ingredient.query.filter(db.func.lower(Ingredient.name) == ingredient_name_lower).first()
+    if existing_ingredient:
+        return create_response("error", 409, f"Ingredient '{ingredient_name_stripped}' already exists.", existing_ingredient.to_dict())
+
+    try:
+        new_ingredient = Ingredient(name=ingredient_name_stripped)
+        db.session.add(new_ingredient)
+
+        processed_allergen_names = normalize_string_list(allergen_names_raw)
+        associated_allergens_count = 0
+        unknown_allergens_input = []
+
+        if processed_allergen_names:
+            for allergen_name_norm in processed_allergen_names:
+                # Case-insensitive check for existing allergen
+                allergen_obj = Allergen.query.filter(db.func.lower(Allergen.name) == allergen_name_norm).first()
+                if allergen_obj:
+                    new_ingredient.allergens.append(allergen_obj)
+                    associated_allergens_count += 1
+                else:
+                    # Find the original casing for the unknown allergen name for reporting
+                    original_unknown_name = next((raw_name for raw_name in allergen_names_raw if isinstance(raw_name, str) and raw_name.lower().strip() == allergen_name_norm), allergen_name_norm)
+                    unknown_allergens_input.append(original_unknown_name)
+        
+        db.session.commit()
+
+        response_message = f"Ingredient '{new_ingredient.name}' added successfully."
+        details = new_ingredient.to_dict()
+        if unknown_allergens_input:
+            response_message += f" {associated_allergens_count} allergen(s) associated."
+            details['warnings'] = {
+                "unknown_allergens_provided": unknown_allergens_input,
+                "note": "These allergen names were provided but not found in the database and were not associated."
+            }
+        return create_response("success", 201, response_message, details)
+
+    except Exception as e:
+        db.session.rollback()
+        return create_response("error", 500, "An error occurred while adding the ingredient", str(e))
 
 @app.route('/foods/', defaults={'foodname': None})
 @app.route('/foods/<path:foodname>', methods=['GET'])

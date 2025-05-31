@@ -1,6 +1,6 @@
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy.dialects.postgresql import JSON
-from sqlalchemy import CheckConstraint, UniqueConstraint
+from sqlalchemy import CheckConstraint, UniqueConstraint, ForeignKey
 from datetime import datetime
 
 db = SQLAlchemy()
@@ -139,6 +139,7 @@ class Food(db.Model):
     carbs_per_serving = db.Column(db.Float, default=0)
     fat_per_serving = db.Column(db.Float, default=0)
     sugar_per_serving = db.Column(db.Float, default=0)
+    sodium_per_serving = db.Column(db.Float, nullable=True, default=None)
     serving_size = db.Column(db.Float(50), default=100) # Default serving size is 100g
     category = db.Column(db.String(50))
     meal_type = db.Column(db.String(20), nullable=False)  # ✅ Now required
@@ -167,6 +168,7 @@ class Food(db.Model):
             'carbs_per_serving': self.carbs_per_serving,
             'fat_per_serving': self.fat_per_serving,
             'sugar_per_serving': self.sugar_per_serving,
+            'sodium_per_serving': self.sodium_per_serving,
             'serving_size': self.serving_size,
             'category': self.category,
             'meal_type': self.meal_type,
@@ -216,4 +218,158 @@ class ScannedHistory(db.Model):
             'scanned_at': self.scanned_at.isoformat() if self.scanned_at else None,
             'meal_time': self.meal_time,
             'servings': self.servings
+        }
+    
+# Association table for the many-to-many relationship between Ingredient and Allergen
+ingredient_allergen_association = db.Table('ingredient_allergen_association',
+    db.Column('ingredient_id', db.Integer, db.ForeignKey('ingredients.ingredient_id', ondelete='CASCADE'), primary_key=True),
+    db.Column('allergen_id', db.Integer, db.ForeignKey('allergens.allergen_id', ondelete='CASCADE'), primary_key=True)
+)
+
+class Allergen(db.Model):
+    __tablename__ = 'allergens'
+
+    allergen_id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), unique=True, nullable=False) # e.g., "Gluten", "Dairy", "Peanuts"
+    description = db.Column(db.Text, nullable=True)
+
+    # Relationship: An allergen can be linked to many ingredients
+    # Changed to a many-to-many relationship
+    ingredients = db.relationship(
+        'Ingredient',
+        secondary=ingredient_allergen_association,
+        back_populates='allergens',
+        lazy='dynamic'  # Or 'select' / 'joined' based on access patterns
+    )
+
+
+    def to_dict(self):
+        return {
+            'allergen_id': self.allergen_id,
+            'name': self.name,
+            'description': self.description,
+            'associated_ingredients': [{'ingredient_id': ingredient.ingredient_id, 'name': ingredient.name} for ingredient in self.ingredients]
+        }
+
+class Ingredient(db.Model):
+    __tablename__ = 'ingredients'
+
+    ingredient_id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255), unique=True, nullable=False) # e.g., "Whole Wheat Flour", "Cow's Milk"
+    # allergen_id = db.Column(db.Integer, db.ForeignKey('allergens.allergen_id'), nullable=True) # REMOVED: Replaced by many-to-many
+
+    # New many-to-many relationship to Allergen
+    allergens = db.relationship(
+        'Allergen',
+        secondary=ingredient_allergen_association,
+        back_populates='ingredients',
+        lazy='dynamic' # Or 'select' / 'joined'
+    )
+
+    def to_dict(self):
+        return {
+            'ingredient_id': self.ingredient_id,
+            'name': self.name,
+            'associated_allergens': [{'allergen_id': allergen.allergen_id, 'name': allergen.name} for allergen in self.allergens]
+        }
+
+class FoodItemIngredient(db.Model):
+    __tablename__ = 'food_item_ingredients' # Changed from FoodIngredients for clarity
+
+    food_item_ingredient_id = db.Column(db.Integer, primary_key=True)
+    foodId = db.Column(db.Integer, db.ForeignKey('foods.foodId', ondelete='CASCADE'), nullable=False)
+    ingredientId = db.Column(db.Integer, db.ForeignKey('ingredients.ingredient_id', ondelete='CASCADE'), nullable=False)
+    quantity_description = db.Column(db.String(100), nullable=True) # e.g., "1 cup", "100g", "to taste"
+    notes = db.Column(db.Text, nullable=True) # e.g., "finely chopped"
+
+    # Relationships
+    food = db.relationship('Food', backref=db.backref('food_ingredients_association', lazy=True, cascade="all, delete-orphan"))
+    ingredient = db.relationship('Ingredient', backref=db.backref('ingredient_in_foods_association', lazy=True))
+
+    __table_args__ = (
+        UniqueConstraint('foodId', 'ingredientId', name='unique_food_ingredient'),
+    )
+
+    def to_dict(self):
+        return {
+            'food_item_ingredient_id': self.food_item_ingredient_id,
+            'foodId': self.foodId,
+            'ingredientId': self.ingredientId,
+            'ingredient_name': self.ingredient.name if self.ingredient else None, # For convenience
+            'quantity_description': self.quantity_description,
+            'notes': self.notes
+        }
+
+class MedicalConditionDietaryGuideline(db.Model):
+    __tablename__ = 'medical_condition_dietary_guidelines'
+
+    guideline_id = db.Column(db.Integer, primary_key=True)
+    condition_name = db.Column(db.String(255), nullable=False, index=True) # e.g., "Hypertension", "Type 2 Diabetes"
+    guideline_type = db.Column(db.String(100), nullable=False)
+    # Examples: "AVOID_INGREDIENT_NAME", "AVOID_ALLERGEN_NAME", "LIMIT_NUTRIENT", "PREFER_FOOD_TAG"
+    parameter_target = db.Column(db.String(255), nullable=False)
+    # Examples: "Salt" (ingredient), "Gluten" (allergen), "Sodium" (nutrient), "low-sodium" (tag)
+    parameter_target_type = db.Column(db.String(50), nullable=False)
+    # Examples: "INGREDIENT", "ALLERGEN", "NUTRIENT", "TAG"
+    threshold_value = db.Column(db.Float, nullable=True) # e.g., 2000 (for sodium mg/day)
+    threshold_unit = db.Column(db.String(50), nullable=True) # e.g., "mg/day", "g/serving"
+    severity = db.Column(db.String(50), nullable=True) # e.g., "Strict Avoid", "Limit", "Recommended"
+    description = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'guideline_id': self.guideline_id,
+            'condition_name': self.condition_name,
+            'guideline_type': self.guideline_type,
+            'parameter_target': self.parameter_target,
+            'parameter_target_type': self.parameter_target_type,
+            'threshold_value': self.threshold_value,
+            'threshold_unit': self.threshold_unit,
+            'severity': self.severity,
+            'description': self.description,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+class UserFoodInteraction(db.Model):
+    __tablename__ = 'user_food_interactions'
+
+    interaction_id = db.Column(db.Integer, primary_key=True)
+    userId = db.Column(db.Integer, db.ForeignKey('users.userid', ondelete='CASCADE'), nullable=False)
+    foodId = db.Column(db.Integer, db.ForeignKey('foods.foodId', ondelete='CASCADE'), nullable=False)
+
+    is_bookmarked = db.Column(db.Boolean, default=True, nullable=False)
+    # 'state' from your request: False if only bookmarked, True if cooked
+    has_been_cooked = db.Column(db.Boolean, default=False, nullable=False)
+
+    rating = db.Column(db.Integer, nullable=True) # e.g., 1-5
+    notes = db.Column(db.Text, nullable=True) # User's personal notes about the food/recipe
+
+    bookmarked_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    cooked_at = db.Column(db.DateTime, nullable=True) # Timestamp when marked as cooked
+    last_updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # Relationships
+    user = db.relationship('User', backref=db.backref('food_interactions', lazy='dynamic'))
+    food = db.relationship('Food', backref=db.backref('user_interactions', lazy='dynamic'))
+
+    __table_args__ = (
+        UniqueConstraint('userId', 'foodId', name='unique_user_food_interaction'),
+        CheckConstraint("rating IS NULL OR (rating >= 1 AND rating <= 5)", name="valid_rating_constraint"),
+    )
+
+    def to_dict(self):
+        return {
+            'interaction_id': self.interaction_id,
+            'userId': self.userId,
+            'foodId': self.foodId,
+            'is_bookmarked': self.is_bookmarked,
+            'has_been_cooked': self.has_been_cooked,
+            'rating': self.rating,
+            'notes': self.notes,
+            'bookmarked_at': self.bookmarked_at.isoformat() if self.bookmarked_at else None,
+            'cooked_at': self.cooked_at.isoformat() if self.cooked_at else None,
+            'last_updated_at': self.last_updated_at.isoformat() if self.last_updated_at else None
         }
