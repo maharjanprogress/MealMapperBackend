@@ -239,16 +239,16 @@ class Allergen(db.Model):
         'Ingredient',
         secondary=ingredient_allergen_association,
         back_populates='allergens',
-        lazy='dynamic'  # Or 'select' / 'joined' based on access patterns
+        lazy='select'
     )
 
 
     def to_dict(self):
         return {
-            'allergen_id': self.allergen_id,
+            'id': self.allergen_id,
             'name': self.name,
             'description': self.description,
-            'associated_ingredients': [{'ingredient_id': ingredient.ingredient_id, 'name': ingredient.name} for ingredient in self.ingredients]
+            'associated_ingredients': [{'name': ingredient.name} for ingredient in self.ingredients]
         }
 
 class Ingredient(db.Model):
@@ -263,14 +263,14 @@ class Ingredient(db.Model):
         'Allergen',
         secondary=ingredient_allergen_association,
         back_populates='ingredients',
-        lazy='dynamic' # Or 'select' / 'joined'
+        lazy='select'
     )
 
     def to_dict(self):
         return {
-            'ingredient_id': self.ingredient_id,
+            'id': self.ingredient_id,
             'name': self.name,
-            'associated_allergens': [{'allergen_id': allergen.allergen_id, 'name': allergen.name} for allergen in self.allergens]
+            'associated_allergens': [{'name': allergen.name} for allergen in self.allergens]
         }
 
 class FoodItemIngredient(db.Model):
