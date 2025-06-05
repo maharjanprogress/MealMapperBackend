@@ -163,6 +163,98 @@ def add_user():
         db.session.rollback()  # Rollback the transaction in case of an error
         return create_response("error", 500, "An error occurred", str(e))
 
+@app.route('/allOngoingChallenge/', defaults={'challengeSearch': None}, methods=['GET'])
+@app.route('/allOngoingChallenge/<path:challengeSearch>', methods=['GET'])
+def get_all_challenges(challengeSearch):
+    today = datetime.today()
+    
+    query = Challenge.query.filter(Challenge.deadline > today)
+
+    if challengeSearch:
+        search_term = f"%{challengeSearch.lower()}%"
+        query = query.filter(
+            db.or_(
+                Challenge.title.ilike(search_term),
+                Challenge.description.ilike(search_term)
+            )
+        )
+    
+    challenges = query.all()
+    
+    return create_response("success", 200, "Ongoing challenges retrieved successfully", [{'id': challenge.challengeId, 'title': challenge.title, 'description': challenge.description, 'difficulty': challenge.difficulty, 'reward_points': challenge.reward_points, 'deadline': challenge.deadline.isoformat()} for challenge in challenges])
+
+@app.route('/challenge/<int:challengeId>', methods=['GET'])
+def get_challenge_by_id(challengeId):
+    challenge = Challenge.query.get(challengeId)
+    if not challenge:
+        return create_response("error", 404, "Challenge not found", None)
+    return create_response("success", 200, "Challenge retrieved successfully", challenge.to_dict())
+
+@app.route('/challenge/<int:challengeId>', methods=['PUT'])
+def update_challenge(challengeId):
+    if not request.is_json:
+        return create_response("error", 415, "Content-Type must be application/json")
+
+    data = request.get_json()
+    challenge = db.session.get(Challenge, challengeId)
+
+    if not challenge:
+        return create_response("error", 404, f"Challenge with ID {challengeId} not found")
+
+    updates_made = False
+
+    # Validate and update title
+    if 'title' in data:
+        new_title = data.get('title')
+        if isinstance(new_title, str) and new_title.strip():
+            challenge.title = new_title.strip()
+            updates_made = True
+
+    # Validate and update description
+    if 'description' in data: # Description can be an empty string
+        new_description = data.get('description')
+        if isinstance(new_description, str):
+            challenge.description = new_description
+            updates_made = True
+
+    # Validate and update reward_points
+    if 'reward_points' in data:
+        new_reward_points = data.get('reward_points')
+        if isinstance(new_reward_points, int):
+            challenge.reward_points = new_reward_points
+            updates_made = True
+
+    # Validate and update deadline
+    if 'deadline' in data:
+        new_deadline_str = data.get('deadline')
+        try:
+            challenge.deadline = datetime.fromisoformat(new_deadline_str)
+            updates_made = True
+        except (TypeError, ValueError):
+            return create_response("error", 400, "Invalid deadline format. Expected ISO format (e.g., YYYY-MM-DDTHH:MM:SS)")
+
+    # Validate and update difficulty
+    if 'difficulty' in data: # Difficulty can be an empty string or None
+        challenge.difficulty = data.get('difficulty')
+        updates_made = True
+
+    # Validate and update requirements (must be a dictionary/JSON object)
+    if 'requirements' in data:
+        new_requirements = data.get('requirements')
+        if isinstance(new_requirements, dict):
+            challenge.requirements = new_requirements
+            updates_made = True
+
+    if updates_made:
+        try:
+            db.session.commit()
+            return create_response("success", 200, f"Challenge '{challenge.title}' updated successfully", challenge.to_dict())
+        except Exception as e:
+            db.session.rollback()
+            return create_response("error", 500, "An error occurred while updating the challenge", str(e))
+    else:
+        return create_response("error", 400, "No valid fields provided for update or no changes made")
+
 @app.route('/challenges/<int:userId>', methods=['GET'])
 def get_challenges_for_user(userId):
     today = datetime.today()
@@ -312,7 +404,7 @@ def get_incompleted_challenges_for_user(userId):
         Challenge.description,
         Challenge.deadline,
         Challenge.reward_points
-    ).join(Challenge, AcceptedChallenge.challengeId == Challenge.challengeId) \
+    ).select_from(AcceptedChallenge).join(Challenge, AcceptedChallenge.challengeId == Challenge.challengeId) \
      .filter(
          AcceptedChallenge.userId == userId,  # Filter by userId
          Challenge.deadline < today,
@@ -1359,36 +1451,156 @@ def update_challenge_progress(foodid, meal_time, serving_size, userid):
         actual_protein = food.protein_per_serving * serving_ratio
         actual_carbs = food.carbs_per_serving * serving_ratio
         actual_calories = food.calories_per_serving * serving_ratio
+        actual_fat = food.fat_per_serving * serving_ratio
+        actual_sugar = food.sugar_per_serving * serving_ratio
+        actual_sodium = food.sodium_per_serving * serving_ratio
         print(actual_protein, actual_carbs, actual_calories,serving_ratio)
 
         # Process each active challenge
         for accepted, challenge in active_challenges:
             requirements = challenge.requirements
-            progress_updated = False
+            if not isinstance(requirements, dict) or not requirements:
+                continue # Skip if no requirements or not a dict
 
-            # Calculate progress based on nutritional requirements
-            if 'required_protein' in requirements:
-                required_protein = requirements['required_protein']
-                protein_progress = (actual_protein / required_protein) * 100
-                accepted.progress = min(100, int(accepted.progress + protein_progress))
-                progress_updated = True
+            progress_changed_in_this_update = False
+            
+            # List to store the percentage progress this scan makes towards each individual requirement's *total* target
+            individual_scan_contributions_pct = []
 
-            if 'required_calories' in requirements:
-                required_calories = requirements['required_calories']
-                calorie_progress = (actual_calories / required_calories) * 100
-                accepted.progress = min(100, int(accepted.progress + calorie_progress))
-                progress_updated = True
+            if 'required_protein' in requirements and requirements['required_protein'] > 0:
+                protein_scan_contrib_pct = (actual_protein / requirements['required_protein']) * 100
+                individual_scan_contributions_pct.append(protein_scan_contrib_pct)
 
-            if 'required_carbs' in requirements:
-                required_carbs = requirements['required_carbs']
-                carbs_progress = (actual_carbs / required_carbs) * 100
-                accepted.progress = min(100, int(accepted.progress + carbs_progress))
-                progress_updated = True
+            if 'required_calories' in requirements and requirements['required_calories'] > 0:
+                calorie_scan_contrib_pct = (actual_calories / requirements['required_calories']) * 100
+                individual_scan_contributions_pct.append(calorie_scan_contrib_pct)
 
-            # Update challenge completion status
-            if accepted.progress >= 100:
+            if 'required_carbs' in requirements and requirements['required_carbs'] > 0:
+                carbs_scan_contrib_pct = (actual_carbs / requirements['required_carbs']) * 100
+                individual_scan_contributions_pct.append(carbs_scan_contrib_pct)
+            
+            if 'required_fat' in requirements and requirements['required_fat'] > 0:
+                fat_scan_contrib_pct = (actual_fat / requirements['required_fat']) * 100
+                individual_scan_contributions_pct.append(fat_scan_contrib_pct)
+
+            if 'required_sugar' in requirements and requirements['required_sugar'] > 0:
+                sugar_scan_contrib_pct = (actual_sugar / requirements['required_sugar']) * 100
+                individual_scan_contributions_pct.append(sugar_scan_contrib_pct)
+
+            if 'required_sodium' in requirements and requirements['required_sodium'] > 0:
+                sodium_scan_contrib_pct = (actual_sodium / requirements['required_sodium']) * 100
+                individual_scan_contributions_pct.append(sodium_scan_contrib_pct)
+
+            if 'min_protein_per_serving' in requirements and requirements['min_protein_per_serving'] > 0:
+                if actual_protein < requirements['min_protein_per_serving']:
+                    # If the scan does not meet the minimum protein requirement, skip this challenge
+                    print(f"Skipping challenge {challenge.challengeId} for user {userid} due to insufficient protein: {actual_protein} < {requirements['min_protein_per_serving']}")
+                    continue
+                else:
+                    # If it meets the minimum protein requirement, we can consider it a valid contribution
+                    individual_scan_contributions_pct.append(100)
+
+            if 'min_calories_per_serving' in requirements and requirements['min_calories_per_serving'] > 0:
+                if actual_calories < requirements['min_calories_per_serving']:
+                    print(f"Skipping challenge {challenge.challengeId} for user {userid} due to insufficient calories: {actual_calories} < {requirements['min_calories_per_serving']}")
+                    continue
+                else:
+                    individual_scan_contributions_pct.append(100)
+
+            if 'min_carbs_per_serving' in requirements and requirements['min_carbs_per_serving'] > 0:
+                if actual_carbs < requirements['min_carbs_per_serving']:
+                    print(f"Skipping challenge {challenge.challengeId} for user {userid} due to insufficient carbs: {actual_carbs} < {requirements['min_carbs_per_serving']}")
+                    continue
+                else:
+                    individual_scan_contributions_pct.append(100)
+
+            if 'min_fat_per_serving' in requirements and requirements['min_fat_per_serving'] > 0:
+                if actual_fat < requirements['min_fat_per_serving']:
+                    print(f"Skipping challenge {challenge.challengeId} for user {userid} due to insufficient fat: {actual_fat} < {requirements['min_fat_per_serving']}")
+                    continue
+                else:
+                    individual_scan_contributions_pct.append(100)
+
+            if 'min_sugar_per_serving' in requirements and requirements['min_sugar_per_serving'] > 0:
+                if actual_sugar < requirements['min_sugar_per_serving']:
+                    print(f"Skipping challenge {challenge.challengeId} for user {userid} due to insufficient sugar: {actual_sugar} < {requirements['min_sugar_per_serving']}")
+                    continue
+                else:
+                    individual_scan_contributions_pct.append(100)
+
+            if 'min_sodium_per_serving' in requirements and requirements['min_sodium_per_serving'] > 0:
+                if actual_sodium < requirements['min_sodium_per_serving']:
+                    print(f"Skipping challenge {challenge.challengeId} for user {userid} due to insufficient sodium: {actual_sodium} < {requirements['min_sodium_per_serving']}")
+                    continue
+                else:
+                    individual_scan_contributions_pct.append(100)
+
+            if 'max_protein_per_serving' in requirements and requirements['max_protein_per_serving'] > 0:
+                if actual_protein > requirements['max_protein_per_serving']:
+                    # If the scan exceeds the maximum protein requirement, skip this challenge
+                    print(f"Skipping challenge {challenge.challengeId} for user {userid} due to excess protein: {actual_protein} > {requirements['max_protein_per_serving']}")
+                    continue
+                else:
+                    # If it meets the maximum protein requirement, we can consider it a valid contribution
+                    individual_scan_contributions_pct.append(100)
+
+            if 'max_calories_per_serving' in requirements and requirements['max_calories_per_serving'] > 0:
+                if actual_calories > requirements['max_calories_per_serving']:
+                    print(f"Skipping challenge {challenge.challengeId} for user {userid} due to excess calories: {actual_calories} > {requirements['max_calories_per_serving']}")
+                    continue
+                else:
+                    individual_scan_contributions_pct.append(100)
+
+            if 'max_carbs_per_serving' in requirements and requirements['max_carbs_per_serving'] > 0:
+                if actual_carbs > requirements['max_carbs_per_serving']:
+                    print(f"Skipping challenge {challenge.challengeId} for user {userid} due to excess carbs: {actual_carbs} > {requirements['max_carbs_per_serving']}")
+                    continue
+                else:
+                    individual_scan_contributions_pct.append(100)
+            
+            if 'max_fat_per_serving' in requirements and requirements['max_fat_per_serving'] > 0:
+                if actual_fat > requirements['max_fat_per_serving']:
+                    print(f"Skipping challenge {challenge.challengeId} for user {userid} due to excess fat: {actual_fat} > {requirements['max_fat_per_serving']}")
+                    continue
+                else:
+                    individual_scan_contributions_pct.append(100)
+
+            if 'max_sugar_per_serving' in requirements and requirements['max_sugar_per_serving'] > 0:
+                if actual_sugar > requirements['max_sugar_per_serving']:
+                    print(f"Skipping challenge {challenge.challengeId} for user {userid} due to excess sugar: {actual_sugar} > {requirements['max_sugar_per_serving']}")
+                    continue
+                else:
+                    individual_scan_contributions_pct.append(100)
+
+            if 'max_sodium_per_serving' in requirements and requirements['max_sodium_per_serving'] > 0:
+                if actual_sodium > requirements['max_sodium_per_serving']:
+                    print(f"Skipping challenge {challenge.challengeId} for user {userid} due to excess sodium: {actual_sodium} > {requirements['max_sodium_per_serving']}")
+                    continue
+                else:
+                    individual_scan_contributions_pct.append(100)
+
+            
+
+
+            if individual_scan_contributions_pct: # If this scan contributed to any relevant requirement
+                # Calculate the average contribution of this scan across all its relevant requirements
+                average_scan_contribution_pct = sum(individual_scan_contributions_pct) / len(individual_scan_contributions_pct)
+                
+                if average_scan_contribution_pct > 0: # Only update if there's a positive contribution
+                    old_progress = accepted.progress
+                    accepted.progress = min(100, int(accepted.progress + average_scan_contribution_pct))
+                    if accepted.progress != old_progress:
+                        progress_changed_in_this_update = True
+
+            # Check for challenge completion
+            # This condition is now based on the accumulated average of scan contributions.
+            # It's an improvement but not a perfect guarantee that *all* individual total requirements are met.
+            challenge_just_completed = False
+            if accepted.progress >= 100 and not accepted.completed:
                 accepted.completed = True
-                accepted.progress = 100
+                accepted.progress = 100 # Cap progress at 100
+                challenge_just_completed = True
+                progress_changed_in_this_update = True # Mark change if it just got completed
                 
                 # Update leaderboard
                 current_season = f"{current_time.year}-Q{(current_time.month-1)//3 + 1}"
@@ -1396,7 +1608,7 @@ def update_challenge_progress(foodid, meal_time, serving_size, userid):
                     userId=userid,
                     season=current_season
                 ).first()
-                
+
                 if not leaderboard:
                     leaderboard = LeaderBoard(
                         userId=userid,
@@ -1408,7 +1620,7 @@ def update_challenge_progress(foodid, meal_time, serving_size, userid):
                 leaderboard.points += challenge.reward_points
                 leaderboard.last_updated_date = current_time
 
-            if progress_updated:
+            if progress_changed_in_this_update:
                 db.session.commit()
 
     except Exception as e:
