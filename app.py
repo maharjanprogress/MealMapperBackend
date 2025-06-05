@@ -955,7 +955,7 @@ def add_medical_condition_guideline():
 
     try:
         new_guideline = MedicalConditionDietaryGuideline(
-            condition_name=condition_name,
+            condition_name=condition_name.strip().lower(),  # Normalize condition name to lowercase
             guideline_type=guideline_type,
             parameter_target=parameter_target,
             parameter_target_type=parameter_target_type,
@@ -973,54 +973,83 @@ def add_medical_condition_guideline():
 
 @app.route('/medical_condition_guidelines/', defaults={'condition_name': None}, methods=['GET'])
 @app.route('/medical_condition_guidelines/<path:condition_name>', methods=['GET'])
-def get_medical_condition_guidelines(condition_name):
+def get_medical_condition_guidelines(condition_name): # Renamed for clarity
     try:
+        grouped_conditions = {} # Use a dictionary to group by condition name
+        message_template = ""
+
         if not condition_name:
-            # Get all unique condition names
-            # Using distinct to avoid duplicates if a condition has multiple guidelines
-            condition_names_query = db.session.query(
-                MedicalConditionDietaryGuideline.condition_name
+            # Case 1: Get all medical conditions and their guidelines
+            all_guidelines_query = db.session.query(
+                MedicalConditionDietaryGuideline.condition_name,
+                MedicalConditionDietaryGuideline.description
             ).distinct().order_by(MedicalConditionDietaryGuideline.condition_name).all()
 
-            # Extract names from the query result (list of tuples)
-            condition_names = [{"name":name[0]} for name in condition_names_query]
+            if not all_guidelines_query:
+                return create_response("success", 200, "No medical condition guidelines found.", [])
 
-            return create_response(
-                "success",
-                200,
-                f"Retrieved all {len(condition_names)} unique medical condition names",
-                condition_names
-            )
+            for c_name, desc in all_guidelines_query:
+                # Names are stored in lowercase, display them in Title Case
+                display_name = c_name.title() 
+                if display_name not in grouped_conditions:
+                    grouped_conditions[display_name] = {
+                        "name": display_name,
+                        "descriptions": []
+                    }
+                # Add description if it's not None and not already present for this condition
+                if desc and desc not in grouped_conditions[display_name]["descriptions"]:
+                    grouped_conditions[display_name]["descriptions"].append(desc)
+            
+            message_template = "Retrieved {count} unique medical condition(s) with their guidelines"
 
-        # If condition_name is provided, search for matching names
-        search_term = condition_name.lower()
+        else:
+            # Case 2: Search for medical conditions by name
+            search_term_normalized = condition_name.lower()
+            
+            matching_guidelines_query = db.session.query(
+                MedicalConditionDietaryGuideline.condition_name,
+                MedicalConditionDietaryGuideline.description
+            ).filter(
+                db.func.lower(MedicalConditionDietaryGuideline.condition_name).ilike(f'%{search_term_normalized}%')
+            ).order_by(MedicalConditionDietaryGuideline.condition_name).all()
 
-        # Find unique condition names that contain the search term (case-insensitive)
-        matching_condition_names_query = db.session.query(
-            MedicalConditionDietaryGuideline.condition_name
-        ).filter(
-            db.func.lower(MedicalConditionDietaryGuideline.condition_name).ilike(f'%{search_term}%')
-        ).distinct().order_by(MedicalConditionDietaryGuideline.condition_name).all()
+            if not matching_guidelines_query:
+                return create_response(
+                    "success", 
+                    200, 
+                    f"No medical conditions found matching '{condition_name}'", 
+                    []
+                )
 
-        # Extract names from the query result
-        matching_condition_names = [{"name":name[0]} for name in matching_condition_names_query]
+            for c_name, desc in matching_guidelines_query:
+                display_name = c_name.title() # Names are stored in lowercase
+                if display_name not in grouped_conditions:
+                    grouped_conditions[display_name] = {
+                        "name": display_name,
+                        "descriptions": []
+                    }
+                if desc and desc not in grouped_conditions[display_name]["descriptions"]:
+                     grouped_conditions[display_name]["descriptions"].append(desc)
+            
+            message_template = "Found {count} medical condition(s) matching '{search_term}'"
 
-        if not matching_condition_names:
-            return create_response(
-                "success", # Use success 200 with empty list for no results in search
-                200,
-                f"No medical conditions found matching '{condition_name}'",
-                []
-            )
+        response_details = list(grouped_conditions.values())
+        found_count = len(response_details)
+        
+        if not condition_name:
+            message = message_template.format(count=found_count)
+        else:
+            message = message_template.format(count=found_count, search_term=condition_name)
 
         return create_response(
             "success",
             200,
-            f"Found {len(matching_condition_names)} medical condition(s) matching '{condition_name}'",
-            matching_condition_names
+            message,
+            response_details
         )
 
     except Exception as e:
+        app.logger.error(f"Error in get_medical_condition_guidelines: {str(e)}", exc_info=True)
         return create_response("error", 500, "An error occurred while retrieving medical condition names", str(e))
 
 @app.route('/medical_condition_guidelines/condition/<path:condition_name>', methods=['GET'])
