@@ -971,6 +971,91 @@ def add_medical_condition_guideline():
         db.session.rollback()
         return create_response("error", 500, "An error occurred while adding the guideline", str(e))
 
+@app.route('/update_add_in_bulk/medical_condition_guidelines', methods=['POST'])
+def bulk_update_medical_condition_guidelines():
+    if not request.is_json:
+        return create_response("error", 415, "Content-Type must be application/json")
+
+    data = request.get_json()
+    guideline_details_list = data.get('details')
+
+    if not isinstance(guideline_details_list, list):
+        return create_response("error", 400, "Request body must contain a 'details' list.")
+
+    results = {
+        "created": [],
+        "updated": [],
+        "deleted": [],
+        "errors": []
+    }
+
+    try:
+        for item_index, item_data in enumerate(guideline_details_list):
+            guideline_id = item_data.get('guideline_id')
+            delete_flag = item_data.get('delete', False)
+
+            if delete_flag:
+                if guideline_id:
+                    guideline_to_delete = db.session.get(MedicalConditionDietaryGuideline, guideline_id)
+                    if guideline_to_delete:
+                        db.session.delete(guideline_to_delete)
+                        results["deleted"].append({"guideline_id": guideline_id, "status": "deleted"})
+                    else:
+                        results["errors"].append({"guideline_id": guideline_id, "status": "delete_failed", "reason": "not_found"})
+                # If delete is true and no guideline_id, do nothing as per requirement
+            else: # Create or Update
+                condition_name = item_data.get('condition_name')
+                guideline_type = item_data.get('guideline_type')
+                parameter_target = item_data.get('parameter_target')
+                parameter_target_type = item_data.get('parameter_target_type')
+
+                if not all([condition_name, guideline_type, parameter_target, parameter_target_type]):
+                    results["errors"].append({"index": item_index, "status": "validation_failed", "reason": "Missing required fields for create/update"})
+                    continue
+
+                if guideline_id: # Update existing
+                    guideline_to_update = db.session.get(MedicalConditionDietaryGuideline, guideline_id)
+                    if guideline_to_update:
+                        guideline_to_update.condition_name = condition_name.strip().lower()
+                        guideline_to_update.guideline_type = guideline_type
+                        guideline_to_update.parameter_target = parameter_target
+                        guideline_to_update.parameter_target_type = parameter_target_type
+                        guideline_to_update.threshold_value = item_data.get('threshold_value')
+                        guideline_to_update.threshold_unit = item_data.get('threshold_unit')
+                        guideline_to_update.severity = item_data.get('severity')
+                        guideline_to_update.description = item_data.get('description')
+                        guideline_to_update.updated_at = datetime.utcnow()
+                        results["updated"].append({"guideline_id": guideline_id, "status": "updated"})
+                    else:
+                        results["errors"].append({"guideline_id": guideline_id, "status": "update_failed", "reason": "not_found"})
+                else: # Create new
+                    new_guideline = MedicalConditionDietaryGuideline(
+                        condition_name=condition_name.strip().lower(),
+                        guideline_type=guideline_type,
+                        parameter_target=parameter_target,
+                        parameter_target_type=parameter_target_type,
+                        threshold_value=item_data.get('threshold_value'),
+                        threshold_unit=item_data.get('threshold_unit'),
+                        severity=item_data.get('severity'),
+                        description=item_data.get('description')
+                    )
+                    db.session.add(new_guideline)
+                    # We can't get the ID until after flush/commit, so we'll report success generically
+                    results["created"].append({"index": item_index, "status": "marked_for_creation"})
+        
+        db.session.commit()
+        # For created items, now that they are committed, you could re-fetch them if you need their IDs in the response.
+        # For simplicity, this example just reports they were marked for creation.
+
+        return create_response("success", 200, "Bulk operation processed.", results)
+
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Error in bulk_update_medical_condition_guidelines: {str(e)}", exc_info=True)
+        results["errors"].append({"status": "transaction_failed", "reason": str(e)})
+        return create_response("error", 500, "An error occurred during bulk operation.", results)
+
+
 @app.route('/medical_condition_guidelines/', defaults={'condition_name': None}, methods=['GET'])
 @app.route('/medical_condition_guidelines/<path:condition_name>', methods=['GET'])
 def get_medical_condition_guidelines(condition_name): # Renamed for clarity
@@ -1139,12 +1224,12 @@ def add_scanned_food(userid):
             # Validate meal_type if provided
             valid_meal_types = ['breakfast', 'lunch', 'dinner']
             if meal_type not in valid_meal_types:
-                return create_response("error", 400, f"Invalid meal type. Must be one of {valid_meal_types}")
+                return create_response("error", 400, f"Invalid meal type. Must be one of {valid_meal_types}",None)
 
         # Find the food by name
         food = Food.query.filter(Food.name.ilike(food_name.lower())).first()
         if not food:
-            return create_response("error", 404, f"Food '{food_name}' not found in database")
+            return create_response("error", 204, f"Food '{food_name}' not found in database",None)
         
         # Check for duplicate entries within last 5 minutes
         five_minutes_ago = datetime.now() - timedelta(minutes=5)
@@ -1384,6 +1469,109 @@ def get_user_scanned_details(userid, months_back):
         )
     except Exception as e:
         return create_response("error", 500, "Error retrieving scanned food details", str(e))
+
+
+@app.route('/nutrients/', defaults={'search_term': None}, methods=['GET'])
+@app.route('/nutrients/<path:search_term>', methods=['GET'])
+def get_nutrients(search_term):
+    try:
+        nutrient_list_names = ["Calories", "Protein", "Carbs", "Fat", "Sugar", "Sodium"]
+        
+        if search_term:
+            search_term_lower = search_term.lower()
+            filtered_nutrients = [n for n in nutrient_list_names if search_term_lower in n.lower()]
+        else:
+            filtered_nutrients = nutrient_list_names
+            
+        # Format as list of {"name": "value"}
+        formatted_nutrients = [{"name": nutrient} for nutrient in filtered_nutrients]
+        
+        message = f"Found {len(formatted_nutrients)} nutrient(s)"
+        if search_term:
+            message += f" matching '{search_term}'"
+        else:
+            message = "Nutrients retrieved successfully"
+
+        return create_response(
+            "success",
+            200,
+            message,
+            formatted_nutrients
+        )
+    except Exception as e:
+        app.logger.error(f"Error in get_nutrients: {str(e)}", exc_info=True)
+        return create_response("error", 500, "An error occurred while retrieving nutrients", str(e))
+
+@app.route('/food_categories/', defaults={'search_term': None}, methods=['GET'])
+@app.route('/food_categories/<path:search_term>', methods=['GET'])
+def get_food_categories(search_term):
+    try:
+        categories_query = db.session.query(Food.category).distinct().order_by(Food.category).all()
+        # Extract names, filter out None or empty strings, and ensure uniqueness again
+        category_names_raw = sorted(list(set(c[0] for c in categories_query if c[0] and c[0].strip())))
+        
+        if search_term:
+            search_term_lower = search_term.lower()
+            filtered_categories = [c for c in category_names_raw if search_term_lower in c.lower()]
+        else:
+            filtered_categories = category_names_raw
+            
+        formatted_categories = [{"name": category} for category in filtered_categories]
+        
+        message = f"Found {len(formatted_categories)} food category(s)"
+        if search_term:
+            message += f" matching '{search_term}'"
+        else:
+            message = "Food categories retrieved successfully"
+
+        return create_response(
+            "success",
+            200,
+            message,
+            formatted_categories
+        )
+    except Exception as e:
+        app.logger.error(f"Error in get_food_categories: {str(e)}", exc_info=True)
+        return create_response("error", 500, "An error occurred while retrieving food categories", str(e))
+
+@app.route('/food_tags/', defaults={'search_term': None}, methods=['GET'])
+@app.route('/food_tags/<path:search_term>', methods=['GET'])
+def get_food_tags(search_term):
+    try:
+        # Static list of meaningful food tags
+        food_tag_list_names = [
+            "vegetarian", "vegan", "gluten-free", "dairy-free", "nut-free",
+            "low-carb", "high-protein", "low-fat", "low-sugar", "low-sodium",
+            "quick-meal", "easy-to-make", "comfort-food", "healthy", "organic",
+            "spicy", "sweet", "sour", "savory", "breakfast-item", "lunch-item",
+            "dinner-item", "snack", "dessert", "baking", "grilling", "slow-cooker"
+        ]
+        
+        if search_term:
+            search_term_lower = search_term.lower()
+            filtered_tags = [t for t in food_tag_list_names if search_term_lower in t.lower()]
+        else:
+            filtered_tags = food_tag_list_names
+            
+        # Format as list of {"name": "value"}
+        formatted_tags = [{"name": tag} for tag in sorted(filtered_tags)]
+
+        message = f"Found {len(formatted_tags)} food tag(s)"
+        if search_term:
+            message += f" matching '{search_term}'"
+        else:
+            message = "Food tags retrieved successfully"
+
+        return create_response(
+            "success",
+            200,
+            message,
+            formatted_tags
+        )
+    except Exception as e:
+        # In a real app, you'd use app.logger.error
+        app.logger.error(f"Error in get_food_tags: {str(e)}", exc_info=True)
+        return create_response("error", 500, "An error occurred while retrieving food tags", str(e))
 
 def get_scanned_details(userid, months_back):
     try:
