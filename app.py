@@ -2,16 +2,22 @@ from flask import Flask, jsonify, request
 from flask import Flask, send_from_directory
 from sqlalchemy.exc import IntegrityError
 from config import Config
-from models import db, User,Challenge,AcceptedChallenge,LeaderBoard,Food,ScannedHistory, Ingredient, Allergen, MedicalConditionDietaryGuideline
+from models import db, User,Challenge,AcceptedChallenge,LeaderBoard,Food,ScannedHistory, Ingredient, Allergen, MedicalConditionDietaryGuideline, ingredient_allergen_association, FoodItemIngredient, UserFoodInteraction
+from sqlalchemy import func
 from datetime import date,datetime,timedelta
 from dateutil.relativedelta import relativedelta
 import os
 from werkzeug.utils import secure_filename
 import numpy as np
 import tensorflow as tf
+import json
 
 app = Flask(__name__)
 app.config.from_object(Config)
+
+# Ensure the upload folder exists
+if not os.path.exists(app.config['UPLOAD_FOLDER']):
+    os.makedirs(app.config['UPLOAD_FOLDER'])
 
 db.init_app(app)
 
@@ -562,65 +568,157 @@ def handle_image():
         print(traceback.format_exc())  # Log the full traceback
         return create_response("error", 500, "An error occurred while processing the image", str(e))
 
+@app.route('/foodsTrainedButNotInDB', methods=['GET'])
+def get_foods_trained_but_not_in_db():
+    foods = Food.query.all()
+    food_names = [food.name for food in foods]
+    # Read the labels from the file
+    with open(r"labels.txt") as f:
+        content = f.readlines()
+    labels = [i.strip() for i in content]
+    # Find foods that are in the labels but not in the database
+    trained_but_not_in_db = [label for label in labels if label not in food_names]
+    if not trained_but_not_in_db:
+        return create_response("success", 200, "All trained foods are already in the database", [])
+    
+    if len(trained_but_not_in_db) == 1:
+        return create_response("success", 200, "This Food is not in the database, Please add it", trained_but_not_in_db[0])
+    return create_response("success", 200, "These "+str(len(trained_but_not_in_db))+" Foods are not in the database, Please add them", trained_but_not_in_db)
 
 @app.route('/foods', methods=['POST'])
 def add_food():
-    # Check if the request is JSON
-    if not request.is_json:
-        return create_response("error", 415, "Content-Type must be application/json")
+    # Expecting multipart/form-data
+    if 'name' not in request.form: # Basic check for form data
+        return create_response("error", 400, "Missing food name in form data.")
 
-    # Parse the JSON request body
-    data = request.get_json()
+    data = request.form # Text data
+    image_file = request.files.get('image') # Image file
 
     # Extract parameters from the JSON body
     name = data.get('name')
+    name_stripped = name.strip().lower() if name else None
     description = data.get('description')
     calories_per_serving = data.get('calories_per_serving')
     protein_per_serving = data.get('protein_per_serving', 0)
     carbs_per_serving = data.get('carbs_per_serving', 0)
     fat_per_serving = data.get('fat_per_serving', 0)
     sugar_per_serving = data.get('sugar_per_serving', 0)
+    sodium_per_serving = data.get('sodium_per_serving', 0)
     serving_size = data.get('serving_size', 100)
     category = data.get('category')
     meal_type = data.get('meal_type')  # Required field
-    tags = data.get('tags')  # JSON object
-    contents = data.get('contents')  # JSON object
-    recipe = data.get('recipe')  # JSON object
-    image_url = data.get('image_url')
+    tags_str = data.get('tags')  # This is a JSON string like "[\"tag1\", \"tag2\"]"
+    contents_str = data.get('contents')  # JSON string
+    recipe_str = data.get('recipe')  # JSON string
+
     popularity_score = data.get('popularity_score', 0)
 
     # Validate required fields
-    if not name or not calories_per_serving or not meal_type:
-        return create_response("error", 400, "Name, calories per serving, and meal type are required")
+    if not name_stripped or calories_per_serving is None or not meal_type or \
+       sodium_per_serving is None or protein_per_serving is None or carbs_per_serving is None or \
+       fat_per_serving is None or sugar_per_serving is None or serving_size is None:
+        return create_response("error", 400, "Name, calories, meal type, serving size, and nutrient values (protein, carbs, fat, sugar) are required.")
 
     # Validate meal_type
     valid_meal_types = ['breakfast', 'lunch', 'dinner']
     if meal_type not in valid_meal_types:
         return create_response("error", 400, f"Invalid meal type. Must be one of {valid_meal_types}")
 
+    # 1. Check if foodname already exists in the database (case-insensitive)
+    existing_food = Food.query.filter(db.func.lower(Food.name) == name_stripped.lower()).first()
+    if existing_food:
+        return create_response("error", 409, f"Food with name '{name_stripped}' already exists.", existing_food.to_dict())
+
+    image_filename_to_save = None
+    if image_file:
+        if image_file.filename == '':
+            return create_response("error", 400, "Image file provided but has no filename.")
+        # Generate a secure filename based on the food name and original extension
+        extension = image_file.filename.rsplit('.', 1)[-1].lower()
+        temp_filename = secure_filename(f"{name_stripped}.{extension}")
+
+        image_save_path = os.path.join(app.config['UPLOAD_FOLDER'], temp_filename)
+        
+        try:
+            image_file.save(image_save_path) # <<< --- ADD THIS LINE TO SAVE THE FILE
+            image_filename_to_save = temp_filename # The actual filename saved
+        except Exception as e:
+            # Log this error
+            print(f"Error saving image: {e}")
+            return create_response("error", 500, "Could not save image file.")
+            
+    else: # Handle case where no image is provided, if allowed by your logic
+        # If image is optional, you might set a default image_url or leave it null
+        # For now, assuming image is required based on your Flutter code.
+        # If not required, you might do: image_db_path = "images/default.jpg" or None
+        print("No image file provided, but it is required for this endpoint.")
+        pass
+
+    # Initialize with None or empty structures
+    parsed_tags = None
+    parsed_contents = None
+    parsed_recipe = None
+
+    try:
+        if tags_str:
+            parsed_tags = json.loads(tags_str) # Parse the string into a Python list
+        if contents_str:
+            parsed_contents = json.loads(contents_str) # Parse into a Python list
+        if recipe_str:
+            parsed_recipe = json.loads(recipe_str) # Parse into a Python dict
+    except json.JSONDecodeError as e:
+        return create_response("error", 400, f"Invalid JSON format for tags, contents, or recipe: {e}")
+
+    # in contents # if parsed_contents is not None find the # ingredients in the database and create a list of Ingredient objects
     try:
         # Create a new Food object
         new_food = Food(
-            name=name,
+            name=name_stripped,
             description=description,
             calories_per_serving=calories_per_serving,
             protein_per_serving=protein_per_serving,
             carbs_per_serving=carbs_per_serving,
             fat_per_serving=fat_per_serving,
             sugar_per_serving=sugar_per_serving,
+            sodium_per_serving=sodium_per_serving,
             serving_size=serving_size,
             category=category,
             meal_type=meal_type,
-            tags=tags,
-            contents=contents,
-            recipe=recipe,
-            image_url=image_url,
+            tags=parsed_tags,
+            contents=parsed_contents,
+            recipe=parsed_recipe,
+            image_url=f"images/{image_filename_to_save}" if image_filename_to_save else None,
             popularity_score=popularity_score
         )
         db.session.add(new_food)  # Add the new food to the session
-        db.session.commit()  # Commit the transaction to save the food
-        return create_response("success", 201, "Food added successfully", new_food.to_dict())
+        # Process FoodItemIngredients based on parsed_contents
+        unknown_ingredients_for_fii_add = []
+        if parsed_contents and isinstance(parsed_contents, list):
+            for item_content in parsed_contents:
+                if isinstance(item_content, dict):
+                    ingredient_name = item_content.get('ingredient')
+                    quantity = item_content.get('quantity') # This will go into quantity_description
+                    note = item_content.get('note')
 
+                    if ingredient_name:
+                        ingredient_obj = Ingredient.query.filter(func.lower(Ingredient.name) == ingredient_name.lower()).first()
+                        if ingredient_obj:
+                            fii = FoodItemIngredient(
+                                ingredient=ingredient_obj, # Link to Ingredient object
+                                quantity_description=quantity,
+                                notes=note
+                            )
+                            new_food.food_ingredients_association.append(fii) # Append to the relationship
+                        else:
+                            unknown_ingredients_for_fii_add.append(ingredient_name)
+                            app.logger.warning(f"Add Food: Ingredient '{ingredient_name}' not found. Not creating FII link for food '{name_stripped}'.")
+        
+        db.session.commit()  # Commit the transaction to save the food
+        response_details = new_food.to_dict()
+        if unknown_ingredients_for_fii_add:
+            response_details['warnings_ingredients'] = f"The following ingredients provided in 'contents' were not found in the database and not linked: {', '.join(unknown_ingredients_for_fii_add)}"
+        return create_response("success", 201, "Food added successfully", response_details)
+    
     except Exception as e:
         db.session.rollback()  # Rollback the transaction in case of an error
         return create_response("error", 500, "An error occurred", str(e))
@@ -636,6 +734,170 @@ def get_all_allergens():
         return create_response("success", 200, "Allergens retrieved successfully", allergen_details)
     except Exception as e:
         return create_response("error", 500, "An error occurred while retrieving allergens", str(e))
+
+@app.route('/foodDetails/<int:food_id>', methods=['GET'])
+def get_food_details_by_id(food_id):
+    try:
+        food = db.session.get(Food, food_id)
+        if not food:
+            return create_response("error", 404, f"Food with ID {food_id} not found.")
+        
+        return create_response(
+            "success",
+            200,
+            f"Details for food '{food.name}' retrieved successfully.",
+            food.to_dict() # Using the comprehensive to_dict() method
+        )
+    except Exception as e:
+        app.logger.error(f"Error retrieving food details for ID {food_id}: {str(e)}", exc_info=True)
+        return create_response("error", 500, "An error occurred while retrieving food details.", str(e))
+
+@app.route('/foods/<int:food_id>', methods=['PUT'])
+def update_food(food_id):
+    food_to_update = db.session.get(Food, food_id)
+    if not food_to_update:
+        return create_response("error", 404, f"Food with ID {food_id} not found.")
+
+    data = request.form
+    image_file = request.files.get('image')
+    updates_made = False
+    old_image_filename = food_to_update.image_url
+    new_image_filename_to_set = old_image_filename # Start with the current one
+
+    try:
+        # Handle name update (must be unique)
+        if 'name' in data and data.get('name').strip() != food_to_update.name:
+            new_name = data.get('name').strip().lower()
+            if not new_name:
+                return create_response("error", 400, "Food name cannot be empty.")
+            existing_food_with_new_name = Food.query.filter(db.func.lower(Food.name) == new_name.lower(), Food.foodId != food_id).first()
+            if existing_food_with_new_name:
+                return create_response("error", 409, f"Another food with name '{new_name}' already exists.")
+            food_to_update.name = new_name
+            updates_made = True
+
+        # Update other fields if present in form data
+        for field in ['description', 'category', 'meal_type']:
+            if field in data: # Check if key exists in form data
+                # If data.get(field) is None (e.g. empty string sent for an optional field),
+                # we might want to keep the old value or set it to None/empty based on model.
+                # For simplicity here, if key is present, we update.
+                setattr(food_to_update, field, data.get(field))
+                updates_made = True
+
+        # Handle JSON string fields: tags, contents, recipe
+        for field_json_str in ['tags', 'recipe']:
+            if field_json_str in data:
+                json_str_value = data.get(field_json_str)
+                if json_str_value: # If not empty string
+                    try:
+                        parsed_value = json.loads(json_str_value)
+                        setattr(food_to_update, field_json_str, parsed_value)
+                    except json.JSONDecodeError as e:
+                        return create_response("error", 400, f"Invalid JSON format for {field_json_str}: {e}")
+                else: # If empty string is provided, set to None or empty list/dict as appropriate
+                    if field_json_str == 'tags' or field_json_str == 'contents':
+                        setattr(food_to_update, field_json_str, []) # Default to empty list
+                    elif field_json_str == 'recipe':
+                        setattr(food_to_update, field_json_str, {}) # Default to empty dict
+                    # If you prefer to set to None, use: setattr(food_to_update, field_json_str, None)
+                updates_made = True
+
+        # Handle 'contents' for both Food.contents and FoodItemIngredient
+        unknown_ingredients_for_fii_update = []
+        if 'contents' in data:
+            json_str_value_contents = data.get('contents')
+            parsed_contents_list = None # This will be the list of dicts for Food.contents
+
+            if json_str_value_contents: # If not empty string
+                try:
+                    parsed_contents_list = json.loads(json_str_value_contents)
+                    if not isinstance(parsed_contents_list, list) or \
+                       not all(isinstance(item, dict) for item in parsed_contents_list):
+                        raise json.JSONDecodeError("Contents must be a JSON array of ingredient objects.", json_str_value_contents, 0)
+                except json.JSONDecodeError as e:
+                    return create_response("error", 400, f"Invalid JSON format for contents: {e}")
+            else: # Empty string for contents means clear existing and set Food.contents to empty list
+                parsed_contents_list = []
+
+            if parsed_contents_list is not None: # If 'contents' key was present
+                # Delete existing FoodItemIngredient associations for this food
+                FoodItemIngredient.query.filter_by(foodId=food_id).delete()
+
+                # Add new FoodItemIngredient associations from parsed_contents_list
+                for item_content in parsed_contents_list: # Iterate if list is not empty
+                    ingredient_name = item_content.get('ingredient')
+                    quantity = item_content.get('quantity') # maps to quantity_description
+                    note = item_content.get('note')
+
+                    if ingredient_name:
+                        ingredient_obj = Ingredient.query.filter(func.lower(Ingredient.name) == ingredient_name.lower()).first()
+                        if ingredient_obj:
+                            fii = FoodItemIngredient(foodId=food_id, ingredientId=ingredient_obj.ingredient_id, quantity_description=quantity, notes=note)
+                            db.session.add(fii)
+                        else:
+                            unknown_ingredients_for_fii_update.append(ingredient_name)
+                            app.logger.warning(f"Update Food: Ingredient '{ingredient_name}' not found. Not creating FII link for food ID '{food_id}'.")
+                
+                food_to_update.contents = parsed_contents_list # Update Food.contents with the new list of dicts
+                updates_made = True
+                
+        for field_float in ['calories_per_serving', 'protein_per_serving', 'carbs_per_serving', 'fat_per_serving', 'sugar_per_serving', 'sodium_per_serving', 'serving_size', 'popularity_score']:
+            if field_float in data:
+                try:
+                    value_str = data.get(field_float)
+                    if value_str is not None and value_str.strip() != "": # Ensure it's not empty string before float conversion
+                        value = float(value_str)
+                        setattr(food_to_update, field_float, value)
+                        updates_made = True
+                except (ValueError, TypeError):
+                    return create_response("error", 400, f"Invalid value for {field_float}. Must be a number.")
+
+        # Handle image update
+        current_food_name_for_filename = food_to_update.name # Use the potentially updated name
+
+        if image_file: # New image uploaded
+            if image_file.filename == '':
+                return create_response("error", 400, "Image file provided but has no filename.")
+            extension = image_file.filename.rsplit('.', 1)[-1].lower()
+            new_image_filename_to_set = secure_filename(f"{current_food_name_for_filename}.{extension}")
+            save_path = os.path.join(app.config['UPLOAD_FOLDER'], new_image_filename_to_set)
+            image_file.save(save_path) # Save the new image
+
+            # If old image exists and is different, delete it
+            if old_image_filename and old_image_filename != new_image_filename_to_set:
+                old_file_path = os.path.join(app.config['UPLOAD_FOLDER'], old_image_filename)
+                if os.path.exists(old_file_path):
+                    os.remove(old_file_path)
+            updates_made = True
+        elif 'name' in data and old_image_filename and data.get('name').strip() != old_image_filename.rsplit('.',1)[0]: # Name changed, no new image, but old image exists
+            # If food name changed, and an old image exists, rename the old image
+            old_ext = old_image_filename.rsplit('.', 1)[-1] if '.' in old_image_filename else ''
+            new_filename_after_rename = secure_filename(f"{current_food_name_for_filename}.{old_ext}")
+            if old_image_filename != new_filename_after_rename: # Ensure rename is necessary
+                old_path = os.path.join(app.config['UPLOAD_FOLDER'], old_image_filename)
+                new_path = os.path.join(app.config['UPLOAD_FOLDER'], new_filename_after_rename)
+                if os.path.exists(old_path):
+                    os.rename(old_path, new_path)
+                new_image_filename_to_set = new_filename_after_rename
+            updates_made = True
+
+        if updates_made:
+            food_to_update.image_url = "images/" + new_image_filename_to_set
+            food_to_update.updated_at = datetime.utcnow()
+            db.session.commit()
+            return create_response("success", 200, "Food updated successfully.", food_to_update.to_dict())
+        else:
+            return create_response("info", 200, "No changes detected or no data provided for update.", food_to_update.to_dict())
+
+    except IntegrityError: # Handles potential unique constraint violation on name if logic above missed it
+        db.session.rollback()
+        return create_response("error", 409, f"Food name '{food_to_update.name}' likely already exists for another item.")
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Error updating food ID {food_id}: {str(e)}", exc_info=True)
+        return create_response("error", 500, "An error occurred while updating the food.", str(e))
+
 
 @app.route('/allergens', methods=['POST'])
 def add_allergen():
@@ -1544,7 +1806,8 @@ def get_food_tags(search_term):
             "low-carb", "high-protein", "low-fat", "low-sugar", "low-sodium",
             "quick-meal", "easy-to-make", "comfort-food", "healthy", "organic",
             "spicy", "sweet", "sour", "savory", "breakfast-item", "lunch-item",
-            "dinner-item", "snack", "dessert", "baking", "grilling", "slow-cooker"
+            "dinner-item", "snack", "dessert", "baking", "grilling", "slow-cooker","chicken","crispy","fried","fast-food",
+            "indian","nepali","chinese","italian","mexican","japanese","korean"
         ]
         
         if search_term:
@@ -1860,7 +2123,7 @@ def get_profile(userid):
         # Get all calories for the past 7 days in one query
         daily_calories = db.session.query(
             db.func.date(ScannedHistory.scanned_at).label('date'),
-            db.func.sum(Food.calories_per_serving * ScannedHistory.servings).label('calories')
+            db.func.sum(Food.calories_per_serving * (ScannedHistory.servings/Food.serving_size)).label('calories')
         ).join(
             Food, Food.foodId == ScannedHistory.foodId
         ).filter(
@@ -2178,6 +2441,449 @@ def get_this_month_leaderboards(userid):
 def serve_image(filename):
     return send_from_directory('FoodImage', filename)
 
+##########################################################################################
+def get_current_user_age(user_obj):
+    """Calculates current age of the user."""
+    if not user_obj or not user_obj.joindate or user_obj.age is None:
+        return None # Or a default age like 25 if appropriate
+    today = date.today()
+    # Age at joining + years passed since joining
+    years_passed = today.year - user_obj.joindate.year - \
+                   ((today.month, today.day) < (user_obj.joindate.month, user_obj.joindate.day))
+    return user_obj.age + years_passed
+
+def calculate_nutritional_targets(user, age):
+    """
+    Calculates estimated BMR, TDEE, and target calories/macros.
+    Uses Mifflin-St Jeor for BMR.
+    """
+    if not all([user.weight_kg, user.height_cm, age, user.gender is not None, user.activity_level is not None, user.goal is not None]):
+        return None # Not enough info
+
+    # BMR (Mifflin-St Jeor)
+    bmr = (10 * user.weight_kg) + (6.25 * user.height_cm) - (5 * age)
+    if user.gender == 1: # Male
+        bmr += 5
+    elif user.gender == -1: # Female
+        bmr -= 161
+    # else: Other gender, BMR calculation might need adjustment or use average. For now, no adjustment.
+
+    # TDEE
+    activity_factors = {-1: 1.2, 0: 1.55, 1: 1.725} # Sedentary, Moderate, Very Active
+    activity_factor = activity_factors.get(user.activity_level, 1.375) # Default to lightly active if somehow invalid
+    tdee = bmr * activity_factor
+
+    # Calorie Goal Adjustment
+    goal_calorie_adj = {-1: -400, 0: 0, 1: 400} # Slim, Maintain, Gain
+    target_calories = tdee + goal_calorie_adj.get(user.goal, 0)
+
+    # Macronutrient Targets (example: 40% Carbs, 30% Protein, 30% Fat)
+    # Protein can also be g/kg, e.g., 1.6g/kg for active individuals
+    # target_protein_grams = user.weight_kg * 1.6
+    # target_protein_calories = target_protein_grams * 4
+    # For simplicity with percentages:
+    target_protein_calories = target_calories * 0.30
+    target_carb_calories = target_calories * 0.40
+    target_fat_calories = target_calories * 0.30
+
+    return {
+        "calories": round(target_calories),
+        "protein": round(target_protein_calories / 4), # grams
+        "carbs": round(target_carb_calories / 4),     # grams
+        "fat": round(target_fat_calories / 9)         # grams
+    }
+
+def get_todays_intake(user_id):
+    """Calculates total nutrients consumed by the user today."""
+    today_start = datetime.combine(date.today(), datetime.min.time())
+    today_end = datetime.combine(date.today(), datetime.max.time())
+
+    scans_today = db.session.query(
+        ScannedHistory.servings,
+        Food.calories_per_serving, Food.protein_per_serving,
+        Food.carbs_per_serving, Food.fat_per_serving, Food.sugar_per_serving,
+        Food.sodium_per_serving, Food.serving_size, Food.foodId
+    ).join(Food, ScannedHistory.foodId == Food.foodId)\
+     .filter(
+        ScannedHistory.userId == user_id,
+        ScannedHistory.scanned_at >= today_start,
+        ScannedHistory.scanned_at <= today_end
+    ).all()
+
+    intake = {"calories": 0, "protein": 0, "carbs": 0, "fat": 0, "sugar": 0, "sodium": 0, "food_ids": set()}
+    for scan in scans_today:
+        servings_multiplier = scan.servings / (scan.serving_size if scan.serving_size and scan.serving_size > 0 else 100) # Avoid division by zero
+        intake["calories"] += (scan.calories_per_serving or 0) * servings_multiplier
+        intake["protein"] += (scan.protein_per_serving or 0) * servings_multiplier
+        intake["carbs"] += (scan.carbs_per_serving or 0) * servings_multiplier
+        intake["fat"] += (scan.fat_per_serving or 0) * servings_multiplier
+        intake["sugar"] += (scan.sugar_per_serving or 0) * servings_multiplier
+        intake["sodium"] += (scan.sodium_per_serving or 0) * servings_multiplier
+        intake["food_ids"].add(scan.foodId)
+
+    for key in ["calories", "protein", "carbs", "fat", "sugar", "sodium"]:
+        intake[key] = round(intake[key])
+    return intake
+
+def get_excluded_elements_for_user(user):
+    """
+    Determines ingredients, allergens, and food tags to exclude based on user's
+    allergies and medical conditions.
+    Returns: dict with 'ingredient_ids', 'allergen_names_to_avoid', 'food_tags_to_avoid'
+    """
+    excluded = {
+        "ingredient_ids": set(),
+        "allergen_names_to_avoid": set(), # Store names for direct allergen check
+        "food_tags_to_avoid": set()
+    }
+
+    # 1. User's direct allergies (assuming user.allergies is a list of allergen names)
+    if user.allergies and isinstance(user.allergies, list):
+        for allergen_name_from_user in user.allergies:
+            allergen_name_lower = allergen_name_from_user.lower().strip()
+            print(f"Processing allergen: {allergen_name_lower}")
+            excluded["allergen_names_to_avoid"].add(allergen_name_lower)
+            # Find ingredients associated with this allergen
+            allergen_obj = Allergen.query.filter(func.lower(Allergen.name) == allergen_name_lower).first()
+            if allergen_obj:
+                for ingredient in allergen_obj.ingredients:
+                    excluded["ingredient_ids"].add(ingredient.ingredient_id)
+                    print(f"Adding ingredient ID {ingredient.name} for allergen {allergen_name_lower}")
+
+    # 2. Medical Condition Guidelines
+    if user.medical_conditions and isinstance(user.medical_conditions, list):
+        for condition_name_from_user in user.medical_conditions:
+            condition_name_lower = condition_name_from_user.lower().strip()
+            guidelines = MedicalConditionDietaryGuideline.query.filter(
+                func.lower(MedicalConditionDietaryGuideline.condition_name) == condition_name_lower
+            ).all()
+            print(f"Processing medical condition: {condition_name_lower} with {len(guidelines)} guidelines")
+
+            for g in guidelines:
+                target_lower = g.parameter_target.lower()
+                if g.guideline_type == "AVOID_INGREDIENT_NAME" and g.parameter_target_type == "INGREDIENT":
+                    ingredient = Ingredient.query.filter(func.lower(Ingredient.name) == target_lower).first()
+                    if ingredient:
+                        excluded["ingredient_ids"].add(ingredient.ingredient_id)
+                        print(f"Adding ingredient ID {ingredient.name} for condition {condition_name_lower}")
+                if g.guideline_type == "AVOID_ALLERGEN_NAME" and g.parameter_target_type == "ALLERGEN":
+                    excluded["allergen_names_to_avoid"].add(target_lower)
+                    allergen_obj = Allergen.query.filter(func.lower(Allergen.name) == target_lower).first()
+                    if allergen_obj:
+                        for ingredient in allergen_obj.ingredients:
+                            excluded["ingredient_ids"].add(ingredient.ingredient_id)
+                            print(f"Adding ingredient ID {ingredient.name} for allergen {target_lower}")
+                if g.guideline_type == "AVOID_FOOD_TAG" and g.parameter_target_type == "TAG":
+                    excluded["food_tags_to_avoid"].add(target_lower)
+    return excluded
+
+def get_user_food_interactions_maps(user_id):
+    """Fetches user's ratings, cooked, and bookmarked food IDs."""
+    interactions = UserFoodInteraction.query.filter_by(userId=user_id).all()
+    ratings = {i.foodId: i.rating for i in interactions if i.rating is not None}
+    cooked = {i.foodId for i in interactions if i.has_been_cooked}
+    bookmarked = {i.foodId for i in interactions if i.is_bookmarked}
+    return {"ratings": ratings, "cooked": cooked, "bookmarked": bookmarked}
+
+# --- Main Recommendation Function ---
+
+def recommendation(user_id, num_recommendations=10):
+    user = db.session.get(User, user_id)
+    if not user:
+        app.logger.error(f"Recommendation: User with ID {user_id} not found.")
+        return []
+
+    age = get_current_user_age(user)
+    if age is None: # Handle case where age cannot be determined
+        app.logger.warning(f"Recommendation: Could not determine age for user {user_id}. Using default or skipping age-dependent calcs.")
+        # Decide on a fallback or return early if age is critical
+
+    targets = calculate_nutritional_targets(user, age if age is not None else 25) # Use default age if None
+    if not targets:
+        app.logger.error(f"Recommendation: Could not calculate nutritional targets for user {user_id}.")
+        return []
+
+    todays_intake = get_todays_intake(user_id)
+    excluded_elements = get_excluded_elements_for_user(user)
+    user_interactions = get_user_food_interactions_maps(user_id)
+
+    remaining_needs = {
+        "calories": targets["calories"] - todays_intake["calories"],
+        "protein": targets["protein"] - todays_intake["protein"],
+        "carbs": targets["carbs"] - todays_intake["carbs"],
+        "fat": targets["fat"] - todays_intake["fat"],
+    }
+
+    all_foods = Food.query.all()
+    candidate_foods = []
+
+    for food in all_foods:
+        score = 0
+        is_excluded = False
+
+        # Priority 1: Exclusions
+        # Check food tags to avoid
+        if food.tags and isinstance(food.tags, list):
+            if any(tag.lower() in excluded_elements["food_tags_to_avoid"] for tag in food.tags):
+                is_excluded = True
+                # app.logger.debug(f"Excluding food {food.name} due to excluded tag.")
+                continue
+
+        # Check ingredients to avoid (via FoodItemIngredient)
+        food_ingredient_ids = {fii.ingredientId for fii in FoodItemIngredient.query.filter_by(foodId=food.foodId).all()}
+        app.logger.debug(f"Food {food.name} has ingredients: {food_ingredient_ids}")
+        if not excluded_elements["ingredient_ids"].isdisjoint(food_ingredient_ids):
+            is_excluded = True
+            app.logger.debug(f"Excluding food {food.name} due to excluded ingredient ID.")
+            continue
+        
+        # Check allergens to avoid (more complex if food doesn't directly list its allergens)
+        # This part relies on ingredients being correctly linked to allergens.
+        # If a food contains an ingredient that belongs to an "allergen_names_to_avoid", it's covered by ingredient_ids.
+        # A direct check could be: if food has an "allergen" field and it matches. (Not in current Food model)
+
+        if is_excluded:
+            continue
+
+        # Priority 3 (Dietary Preference - can act as a strong filter)
+        if user.dietary_pref:
+            pref_lower = user.dietary_pref.lower()
+            food_tags_lower = [t.lower() for t in food.tags] if food.tags else []
+            
+            if pref_lower == "vegetarian":
+                if "vegan" not in food_tags_lower and "vegetarian" not in food_tags_lower: # If not explicitly tagged
+                    # Basic check for meat in name/category (can be improved)
+                    if "meat" in (food.category.lower() if food.category else "") or \
+                       any(m_word in food.name.lower() for m_word in ["chicken", "beef", "pork", "lamb", "fish", "seafood"]):
+                        score -= 1000 # Effectively exclude
+            elif pref_lower == "vegan":
+                if "vegan" not in food_tags_lower:
+                     score -= 1000 # Effectively exclude
+
+        if score <= -1000: # Hard exclusion by preference
+            continue
+
+        # Priority 2: Nutritional Fit & Recent Intake
+        # Calories: Aim for foods that help meet remaining needs without overshooting too much
+        # This is a simple heuristic, can be much more sophisticated
+        calories_per_serving = food.calories_per_serving or 0
+        if remaining_needs["calories"] > 0:
+            if 0.1 * remaining_needs["calories"] < calories_per_serving < 0.7 * remaining_needs["calories"]:
+                score += 30 # Good fit for remaining calories
+            elif calories_per_serving > remaining_needs["calories"] * 1.2: # Significantly over
+                score -= 20
+        elif calories_per_serving > 300 : # If calorie needs met, penalize high calorie items
+             score -= 15
+
+
+        # Protein: Prioritize if protein is needed
+        protein_per_serving = food.protein_per_serving or 0
+        if remaining_needs["protein"] > 10 and protein_per_serving > 15: # Needs protein, food is good source
+            score += 25
+        elif remaining_needs["protein"] < -10 and protein_per_serving > 20: # Already over protein, penalize very high protein
+            score -= 10
+
+        # Similar logic for carbs and fat can be added.
+
+        # Penalty for already eaten today
+        if food.foodId in todays_intake["food_ids"]:
+            score -= 15
+
+        # Priority 3: User Interactions & Preferences (continued)
+        if user.dietary_pref and food.tags:
+            pref_lower = user.dietary_pref.lower()
+            food_tags_lower = [t.lower() for t in food.tags]
+            if pref_lower in food_tags_lower:
+                score += 20 # Matches general dietary preference tag
+
+        if food.foodId in user_interactions["ratings"]:
+            score += user_interactions["ratings"][food.foodId] * 8 # Rating 1-5 -> 8-40 points
+        if food.foodId in user_interactions["cooked"]:
+            score += 10
+        if food.foodId in user_interactions["bookmarked"]:
+            score += 5
+        
+        # Add food and its score to candidates
+        candidate_foods.append({"food": food, "score": score})
+
+    # Sort candidates by score in descending order
+    sorted_foods = sorted(candidate_foods, key=lambda x: x["score"], reverse=True)
+
+    # Format output
+    recommendations_output = []
+    for item in sorted_foods[:num_recommendations]:
+        f = item["food"]
+        recommendations_output.append({
+            "foodId": f.foodId,
+            "name": f.name,
+            "description": f.description
+            # "debug_score": item["score"] # Optional: for debugging
+        })
+    
+    app.logger.info(f"Generated {len(recommendations_output)} recommendations for user {user_id}.")
+    return recommendations_output
+
+# --- Recommendation Endpoint ---
+@app.route('/recommendations/<int:user_id>', methods=['GET'])
+def get_recommendations(user_id):
+    try:
+        num_recs_str = request.args.get('count', '10')
+        try:
+            num_recs = int(num_recs_str)
+            if not (1 <= num_recs <= 50): # Limit count
+                num_recs = 10
+        except ValueError:
+            num_recs = 10
+
+        recs = recommendation(user_id, num_recommendations=num_recs)
+        if not recs:
+            return create_response("success", 200, "No specific recommendations could be generated at this time, or user data is insufficient.", [])
+        return create_response("success", 200, f"Successfully retrieved {len(recs)} food recommendations.", recs)
+    except Exception as e:
+        app.logger.error(f"Error in /recommendations/{user_id}: {str(e)}", exc_info=True)
+        return create_response("error", 500, "An error occurred while generating recommendations.", str(e))
+
+#######################################################################################################
+
+def recommendationByCopilot(userId, num_recommendations=10):
+    try:
+        # Get user and validate
+        user = db.session.get(User, userId)
+        if not user:
+            return []
+
+        # Priority 1: Medical Conditions and Allergies
+        excluded_foods = set()
+        
+        # Check allergies
+        if user.allergies:
+            allergen_ingredients = set()
+            for allergen_name in user.allergies:
+                allergen = Allergen.query.filter(db.func.lower(Allergen.name) == allergen_name.lower()).first()
+                if allergen:
+                    for ingredient in allergen.ingredients:
+                        allergen_ingredients.add(ingredient.ingredient_id)
+            
+            # Get foods containing allergenic ingredients
+            allergenic_foods = db.session.query(Food.foodId).join(
+                FoodItemIngredient,
+                Food.foodId == FoodItemIngredient.foodId
+            ).filter(
+                FoodItemIngredient.ingredientId.in_(allergen_ingredients)
+            ).all()
+            
+            excluded_foods.update([f[0] for f in allergenic_foods])
+
+        # Priority 2: Health Metrics and Today's Intake
+        # Calculate BMI
+        height_m = user.height_cm / 100
+        bmi = user.weight_kg / (height_m * height_m) if height_m > 0 else 0
+
+        # Get today's intake
+        today = datetime.today()
+        today_scans = db.session.query(
+            db.func.sum(Food.calories_per_serving * ScannedHistory.servings).label('calories'),
+            db.func.sum(Food.protein_per_serving * ScannedHistory.servings).label('protein')
+        ).join(
+            Food, ScannedHistory.foodId == Food.foodId
+        ).filter(
+            ScannedHistory.userId == userId,
+            db.func.date(ScannedHistory.scanned_at) == today.date()
+        ).first()
+
+        total_calories_today = float(today_scans.calories or 0)
+        total_protein_today = float(today_scans.protein or 0)
+
+        # Calculate target calories based on metrics
+        base_calories = 2000  # Base value
+        if user.activity_level == 1:  # Very Active
+            base_calories *= 1.5
+        elif user.activity_level == -1:  # Not Active
+            base_calories *= 0.8
+
+        if user.goal == 1:  # Gain Weight
+            target_calories = base_calories * 1.2
+        elif user.goal == -1:  # Lose Weight
+            target_calories = base_calories * 0.8
+        else:
+            target_calories = base_calories
+
+        remaining_calories = target_calories - total_calories_today
+
+        # Query all foods
+        foods = Food.query.filter(~Food.foodId.in_(excluded_foods)).all()
+        scored_foods = []
+
+        # Get user's food interactions
+        interactions = UserFoodInteraction.query.filter_by(userId=userId).all()
+        ratings = {i.foodId: i.rating for i in interactions if i.rating}
+
+        for food in foods:
+            score = 0
+            
+            # Priority 2: Health Metrics Scoring
+            calories_fit = abs(food.calories_per_serving - (remaining_calories / 3))  # Assume 3 meals
+            score += (1000 - calories_fit) / 100  # Better fit = higher score
+
+            if user.goal == 1 and food.protein_per_serving > 20:  # Weight gain, prioritize protein
+                score += 30
+            elif user.goal == -1 and food.calories_per_serving < 400:  # Weight loss, prioritize low-cal
+                score += 30
+
+            # Priority 3: Dietary Preferences and Ratings
+            if user.dietary_pref and food.tags:
+                if user.dietary_pref.lower() in [tag.lower() for tag in food.tags]:
+                    score += 20
+
+            if food.foodId in ratings:
+                score += ratings[food.foodId] * 5
+
+            scored_foods.append((food, score))
+
+        # Sort by score and get top recommendations
+        scored_foods.sort(key=lambda x: x[1], reverse=True)
+        recommendations = []
+        for food, _ in scored_foods[:num_recommendations]:
+            recommendations.append({
+                'foodId': food.foodId,
+                'name': food.name,
+                'description': food.description
+            })
+
+        return recommendations
+
+    except Exception as e:
+        print(f"Error in recommendationByCopilot: {str(e)}")
+        return []
+
+# Endpoint
+@app.route('/recommendations/copilot/<int:userId>', methods=['GET'])
+def get_copilot_recommendations(userId):
+    try:
+        recommendations = recommendationByCopilot(userId)
+        if not recommendations:
+            return create_response(
+                "success", 
+                200, 
+                "No recommendations available or user not found.", 
+                []
+            )
+        
+        return create_response(
+            "success",
+            200,
+            f"Successfully retrieved {len(recommendations)} recommendations.",
+            recommendations
+        )
+    except Exception as e:
+        return create_response(
+            "error",
+            500,
+            "An error occurred while generating recommendations.",
+            str(e)
+        )
+
+#######################################################################################################
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()  # only creates tables if they don’t exist

@@ -183,9 +183,11 @@ class Food(db.Model):
     
     def to_dictFind(self):
         return {
+            'foodId': self.foodId,
             'name': self.name,
             'meal_type': self.meal_type,
-            'serving_size': self.serving_size
+            'serving_size': self.serving_size,
+            'image_url': self.image_url
         }
 
 class ScannedHistory(db.Model):
